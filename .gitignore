@@ -1,9 +1,29 @@
+# Python
 __pycache__/
-.pytest_cache/
 *.py[cod]
+*$py.class
+
+# Python virtual environments
+.venv/
+venv/
+env/
+
+# TypeScript / Vite
+*.tsbuildinfo
+
+# Generated Vite files
+Frontend/vite.config.js
+Frontend/vite.config.d.ts
+
+# Environment
 .env
 .env.*
-Frontend/node_modules/
-Frontend/dist/
-Frontend/.env
-Frontend/.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

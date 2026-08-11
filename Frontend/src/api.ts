@@ -17,6 +17,10 @@ export type ProblemForm = {
   representation: string
 }
 
+export type AIProblem = Omit<ProblemForm, 'representation'> & {
+  representation: string | null
+}
+
 export type Analysis = {
   problem: Record<string, unknown>
   validation: { valid: boolean; blocking: boolean; errors: string[]; warnings: string[] }
@@ -26,10 +30,11 @@ export type Analysis = {
 }
 
 export type AIModel = {
-  problem: ProblemForm
+  problem: AIProblem
   explanation: string
   assumptions: string[]
   dataset: { filename: string; row_count: number; column_count: number; columns: string[]; sample_rows: Record<string, string>[] }
+  incomplete: boolean
 }
 
 const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8001'

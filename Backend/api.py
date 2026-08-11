@@ -43,11 +43,25 @@ class ProblemInput(BaseModel):
     representation: SolutionRepresentationKind = SolutionRepresentationKind.VECTOR
 
 
+class AIDraftProblem(BaseModel):
+    """AI proposal contract. Unlike ProblemInput, this may be incomplete."""
+    name: str = Field(min_length=1)
+    description: Optional[str] = None
+    problem_family: ProblemFamily = ProblemFamily.GENERIC
+    mathematical_properties: List[MathematicalProperty] = Field(default_factory=list)
+    variables: List[VariableInput] = Field(default_factory=list)
+    objective_kind: ObjectiveKind = ObjectiveKind.SINGLE
+    objective_sense: ObjectiveSense = ObjectiveSense.MINIMIZE
+    expression: str = ""
+    representation: Optional[SolutionRepresentationKind] = None
+
+
 class AIModelResponse(BaseModel):
     problem: Dict[str, Any]
     explanation: str
     assumptions: List[str]
     dataset: Dict[str, Any]
+    incomplete: bool = False
 
 
 class ValidationResponse(BaseModel):
@@ -261,17 +275,38 @@ def summarize_csv(content: bytes, filename: str) -> Dict[str, Any]:
     }
 
 
-def validate_ai_draft(draft: Dict[str, Any]) -> ProblemInput:
-    # Pydantic validates enum values, required fields and basic structure.
-    # The expression parser is applied later by build_problem, so the AI cannot
-    # bypass the same deterministic domain validation used by manual mode.
+def validate_ai_draft(draft: Dict[str, Any]) -> AIDraftProblem:
+    # AI proposals have a separate, intentionally permissive contract.
+    # Manual / executable analysis remains strict through ProblemInput.
+
     allowed = {
-        "name", "description", "problem_family", "mathematical_properties",
-        "variables", "objective_kind", "objective_sense", "expression",
+        "name",
+        "description",
+        "problem_family",
+        "mathematical_properties",
+        "variables",
+        "objective_kind",
+        "objective_sense",
+        "expression",
         "representation",
     }
-    candidate = {key: value for key, value in draft.items() if key in allowed}
-    return ProblemInput.model_validate(candidate)
+
+    candidate = {
+        key: value
+        for key, value in draft.items()
+        if key in allowed
+    }
+
+    # In an incomplete AI draft, representation may legitimately be
+    # undefined. LLMs sometimes return "" instead of null.
+    if candidate.get("representation") in ("", None):
+        candidate["representation"] = None
+
+    # Likewise, an incomplete model may have no mathematical expression.
+    if candidate.get("expression") is None:
+        candidate["expression"] = ""
+
+    return AIDraftProblem.model_validate(candidate)
 
 
 @app.post("/api/model", response_model=AIModelResponse)
@@ -293,10 +328,22 @@ async def model_problem(description: str = Form(...), file: UploadFile = File(..
         }
         draft = GroqLLMService().draft_model(description.strip(), dataset)
         problem_payload = validate_ai_draft(draft)
-        # Run the same deterministic builder used by Advanced Mode now, so the
-        # AI proposal cannot reach the user as a valid-looking model if its
-        # expression or variable references are malformed.
-        build_problem(problem_payload)
+        incomplete = (
+            not problem_payload.variables
+            or not problem_payload.expression.strip()
+        )
+
+        # A draft with no defensible decision variables is intentionally an
+        # intermediate state (Option B). Do not force it through the strict
+        # executable ProblemInput/build_problem path. Complete drafts still
+        # receive the exact same deterministic parser/builder validation used
+        # by Advanced Mode.
+        if not incomplete:
+            build_problem(
+                ProblemInput.model_validate(
+                    problem_payload.model_dump(mode="json")
+                )
+            )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -307,6 +354,7 @@ async def model_problem(description: str = Form(...), file: UploadFile = File(..
         explanation=str(draft.get("explanation", "The AI proposed this model based on your description and dataset.")),
         assumptions=[str(item) for item in draft.get("assumptions", [])],
         dataset={key: value for key, value in dataset.items() if key != "allowed_values"},
+        incomplete=incomplete,
     )
 
 

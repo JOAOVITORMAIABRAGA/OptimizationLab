@@ -5,6 +5,7 @@ from typing import List, Optional, Set, Tuple
 
 from domain.expressions import StructuredExpression
 from domain.problem import ConstraintSpec, DomainSpec, OptimizationProblem, ObjectiveSpec, VariableSpec
+from domain.objectives import ObjectiveKind
 from domain.problem_family import MathematicalProperty, ProblemFamily
 from domain.representations import SolutionRepresentationKind
 from domain.variables import VariableType
@@ -54,6 +55,14 @@ class ValidationEngine:
     def _validate_objective(self, objective: ObjectiveSpec, variables: List[VariableSpec], report: ValidationReport) -> None:
         if not objective.kind:
             report.errors.append("Objective kind is required.")
+        if objective.kind == ObjectiveKind.MULTI:
+            if objective.sense is not None:
+                report.warnings.append("Objective-level sense is ignored for multiobjective models; each objective declares its own sense.")
+            if len(objective.objectives) < 2:
+                report.errors.append("Multiobjective problems require at least two independent objectives.")
+            for component in objective.objectives:
+                self._validate_expression(component.expression, variables, report, context=f"objective:{component.id}")
+            return
         if not objective.sense:
             report.errors.append("Objective sense is required.")
         if objective.expression is None:

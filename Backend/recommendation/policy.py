@@ -29,6 +29,9 @@ class RecommendationScoringPolicy:
             "bfo": 0.03,
             "ga": 0.02,
             "sa": 0.01,
+            "linear_programming": 0.12,
+            "integer_programming": 0.16,
+            "constraint_programming": 0.10,
         }
     )
 
@@ -70,14 +73,17 @@ class RecommendationScoringPolicy:
         if objective_match:
             score += self.weights.objective_match
 
+        # Structural preference for exact classical solvers. This is not a
+        # performance benchmark; it encodes mathematical fit only.
+        if algorithm_id == "linear_programming" and problem_family == ProblemFamily.CONTINUOUS_OPTIMIZATION:
+            score += self.specialization_bonus_by_algorithm_id.get(algorithm_id, 0.0)
+        elif algorithm_id == "integer_programming" and problem_family in {ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.PRODUCTION_PLANNING, ProblemFamily.RESOURCE_ALLOCATION, ProblemFamily.GENERIC}:
+            score += self.specialization_bonus_by_algorithm_id.get(algorithm_id, 0.0)
+        elif algorithm_id == "constraint_programming" and problem_family in {ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.PRODUCTION_PLANNING, ProblemFamily.RESOURCE_ALLOCATION, ProblemFamily.GENERIC}:
+            score += self.specialization_bonus_by_algorithm_id.get(algorithm_id, 0.0)
+
         if not compatibility_is_direct:
             score -= self.weights.adaptation_penalty
 
-        if (
-            problem_family == ProblemFamily.CONTINUOUS_OPTIMIZATION
-            and representation == SolutionRepresentationKind.VECTOR
-            and algorithm_id in self.specialization_bonus_by_algorithm_id
-        ):
-            score += self.specialization_bonus_by_algorithm_id[algorithm_id]
 
         return max(0.0, min(1.0, score))

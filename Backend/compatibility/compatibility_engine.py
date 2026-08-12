@@ -102,6 +102,17 @@ class CompatibilityEngine:
             failed_checks.append("problem_family")
 
         problem_properties = set(problem.mathematical_properties)
+        missing_required_properties = [
+            prop.value for prop in algorithm.required_mathematical_properties
+            if prop not in problem_properties
+        ]
+        if missing_required_properties:
+            reasons.append(
+                "Problem does not declare required mathematical properties: "
+                + ", ".join(missing_required_properties)
+            )
+            failed_checks.append("required_mathematical_properties")
+
         unsupported_properties = []
         for property_name in problem_properties:
             if property_name == MathematicalProperty.UNCONSTRAINED:

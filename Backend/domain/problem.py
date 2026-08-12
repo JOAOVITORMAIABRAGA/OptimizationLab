@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from uuid import uuid4
 
 from .expressions import StructuredExpression
-from .objectives import ObjectiveKind, ObjectiveSense
+from .objectives import ObjectiveKind, ObjectiveSense, ObjectiveSpec
 from .problem_family import MathematicalProperty, ProblemFamily
 from .representations import SolutionRepresentationKind
 from .variables import VariableType
@@ -64,21 +65,6 @@ class SolutionRepresentationSpec:
 
 
 @dataclass
-class ObjectiveSpec:
-    kind: Optional[Union[ObjectiveKind, str]]
-    sense: Optional[Union[ObjectiveSense, str]]
-    expression: Optional[StructuredExpression] = None
-    weights: Optional[List[float]] = None
-    description: Optional[str] = None
-
-    def __post_init__(self) -> None:
-        if isinstance(self.kind, str):
-            self.kind = ObjectiveKind(self.kind)
-        if isinstance(self.sense, str):
-            self.sense = ObjectiveSense(self.sense)
-
-
-@dataclass
 class OptimizationProblem:
     name: str
     objective: ObjectiveSpec
@@ -90,3 +76,4 @@ class OptimizationProblem:
     dataset: Optional[DatasetSpec] = None
     description: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    id: str = field(default_factory=lambda: uuid4().hex)

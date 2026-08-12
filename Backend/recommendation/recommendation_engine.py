@@ -77,11 +77,12 @@ class RecommendationEngine:
         scored_candidates = []
         for recommendation in recommendations:
             direct_support = 0 if any("direct support" in strength.lower() for strength in recommendation.strengths) else 1
-            scored_candidates.append((recommendation.score, direct_support, recommendation.algorithm_id, recommendation))
+            structural_priority = self._structural_priority(problem, recommendation.algorithm_id)
+            scored_candidates.append((recommendation.score, structural_priority, direct_support, recommendation.algorithm_id, recommendation))
 
-        ranked = sorted(scored_candidates, key=lambda item: (-item[0], item[1], item[2]))
+        ranked = sorted(scored_candidates, key=lambda item: (-item[0], item[1], item[2], item[3]))
         ranked_recommendations = []
-        for index, (_, _, _, recommendation) in enumerate(ranked, start=1):
+        for index, (_, _, _, _, recommendation) in enumerate(ranked, start=1):
             ranked_recommendations.append(
                 Recommendation(
                     algorithm_id=recommendation.algorithm_id,
@@ -101,6 +102,17 @@ class RecommendationEngine:
             excluded_algorithms=excluded_algorithms,
             explanation=explanation,
         )
+
+
+    def _structural_priority(self, problem: OptimizationProblem, algorithm_id: str) -> int:
+        properties = set(problem.mathematical_properties)
+        if {MathematicalProperty.INTEGER, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED}.issubset(properties):
+            order = {"integer_programming": 0, "constraint_programming": 1, "ga": 2}
+            return order.get(algorithm_id, 3)
+        if {MathematicalProperty.CONTINUOUS, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED}.issubset(properties):
+            order = {"linear_programming": 0, "pso": 2, "de": 3, "ga": 4}
+            return order.get(algorithm_id, 5)
+        return 0
 
     def _score_candidate(
         self,

@@ -103,8 +103,8 @@ class SolverModel:
     constraint_upper: np.ndarray
 
 
-class OptimizationProblemAdapter:
-    """Converts OptimizationLab's declarative model to scipy solver primitives."""
+class ClassicalModelAdapter:
+    """Adapt the domain model to the backend-neutral linear solver model."""
 
     def __init__(self) -> None:
         self.translator = LinearExpressionTranslator()
@@ -348,3 +348,7 @@ class ScipyMixedIntegerAdapter:
         transformed_objective = float(np.dot(model.objective, result.x) + model.objective_constant)
         objective = -transformed_objective if model.objective_sense == ObjectiveSense.MAXIMIZE else transformed_objective
         return solution, objective
+
+
+# Backward-compatible name for callers that imported the pre-refactor class.
+OptimizationProblemAdapter = ClassicalModelAdapter

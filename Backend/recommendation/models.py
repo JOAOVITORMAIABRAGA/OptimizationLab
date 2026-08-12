@@ -7,6 +7,23 @@ from compatibility.compatibility_engine import CompatibilityStatus
 
 
 @dataclass(frozen=True)
+class AlgorithmCandidate:
+    """Executable candidate separated from the system's recommendation decision."""
+
+    algorithm_id: str
+    algorithm_name: str
+    compatibility: CompatibilityStatus
+    compatibility_score: float
+    recommendation_score: float
+    adaptation: Tuple[str, ...] = field(default_factory=tuple)
+    estimated_cost: str = "unknown"
+    algorithm_type: str = "heuristic"
+    reasons: Tuple[str, ...] = field(default_factory=tuple)
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+    recommended: bool = False
+
+
+@dataclass(frozen=True)
 class Recommendation:
     algorithm_id: str
     algorithm_name: str
@@ -28,6 +45,7 @@ class ExcludedAlgorithm:
 
 @dataclass(frozen=True)
 class RecommendationResult:
+    candidates: List[AlgorithmCandidate]
     recommendations: List[Recommendation]
     excluded_algorithms: List[ExcludedAlgorithm]
     explanation: str

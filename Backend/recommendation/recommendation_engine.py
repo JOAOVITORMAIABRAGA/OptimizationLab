@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Set, Tuple
+from dataclasses import replace
+from typing import List, Optional, Set, Tuple
 
+from adapters.registry import AdapterRegistry
+from adapters.problem_adapters import BUILTIN_ADAPTER_REGISTRY
 from algorithms.registry import AlgorithmAvailability, AlgorithmDescriptor, AlgorithmRegistry
 from compatibility.compatibility_engine import CompatibilityEngine, CompatibilityStatus
 from domain.objectives import ObjectiveKind
 from domain.problem import OptimizationProblem
-from domain.problem_family import MathematicalProperty, ProblemFamily
-from domain.representations import SolutionRepresentationKind
-from recommendation.models import ExcludedAlgorithm, Recommendation, RecommendationResult
+from domain.problem_family import MathematicalProperty
+from recommendation.models import AlgorithmCandidate, ExcludedAlgorithm, Recommendation, RecommendationResult
 from recommendation.policy import RecommendationScoringPolicy
 
 
 class RecommendationEngine:
+    """Rank already-compatible candidates; never selects on behalf of the user."""
+
     def __init__(self, scoring_policy: Optional[RecommendationScoringPolicy] = None) -> None:
         self.scoring_policy = scoring_policy or RecommendationScoringPolicy()
 
@@ -24,20 +28,21 @@ class RecommendationEngine:
         available_adapters: Optional[Set[str]] = None,
         available_operators: Optional[Set[str]] = None,
     ) -> RecommendationResult:
-        compatibility_engine = compatibility_engine or CompatibilityEngine()
-        if available_adapters is None:
-            available_adapters = set()
+        compatibility_engine = compatibility_engine or CompatibilityEngine(BUILTIN_ADAPTER_REGISTRY)
+        available_adapters = set(available_adapters) if available_adapters is not None else {
+            descriptor.id for descriptor in BUILTIN_ADAPTER_REGISTRY.all()
+        }
 
-        recommendations: List[Recommendation] = []
-        excluded_algorithms: List[ExcludedAlgorithm] = []
+        candidates: List[AlgorithmCandidate] = []
+        excluded: List[ExcludedAlgorithm] = []
+        details: dict[str, tuple[list[str], list[str], list[str]]] = {}
 
         for descriptor in sorted(registry.get_all(), key=lambda item: item.id):
             if descriptor.availability != AlgorithmAvailability.AVAILABLE:
-                excluded_algorithms.append(
+                excluded.append(
                     ExcludedAlgorithm(
                         algorithm_id=descriptor.id,
-                        reason=self._availability_reason(descriptor.availability),
-                        compatibility_status=None,
+                        reason=f"algorithm is {descriptor.availability.value}",
                         evidence=(f"Availability: {descriptor.availability.value}",),
                     )
                 )
@@ -49,11 +54,11 @@ class RecommendationEngine:
                 available_adapters=available_adapters,
                 available_operators=available_operators,
             )
-            if compatibility.status == CompatibilityStatus.INCOMPATIBLE:
-                excluded_algorithms.append(
+            if not compatibility.is_compatible:
+                excluded.append(
                     ExcludedAlgorithm(
                         algorithm_id=descriptor.id,
-                        reason=self._incompatibility_reason(problem, compatibility),
+                        reason="; ".join(compatibility.reasons) or "algorithm is incompatible with the problem",
                         compatibility_status=compatibility.status,
                         evidence=compatibility.reasons,
                     )
@@ -61,192 +66,108 @@ class RecommendationEngine:
                 continue
 
             score, strengths, weaknesses, evidence = self._score_candidate(problem, descriptor, compatibility)
+            candidate = AlgorithmCandidate(
+                algorithm_id=descriptor.id,
+                algorithm_name=descriptor.name,
+                compatibility=compatibility.status,
+                compatibility_score=1.0 if compatibility.status == CompatibilityStatus.COMPATIBLE else 0.9,
+                recommendation_score=score,
+                adaptation=compatibility.required_adapters,
+                estimated_cost=descriptor.estimated_cost,
+                algorithm_type=descriptor.algorithm_type,
+                reasons=compatibility.reasons,
+                warnings=compatibility.warnings,
+            )
+            candidates.append(candidate)
+            details[descriptor.id] = (strengths, weaknesses, evidence)
+
+        ranked = sorted(candidates, key=lambda item: (-item.recommendation_score, -registry.get(item.algorithm_id).recommendation_priority, item.compatibility.value != CompatibilityStatus.COMPATIBLE.value, item.algorithm_id))
+        recommendations: List[Recommendation] = []
+        final_candidates: List[AlgorithmCandidate] = []
+        for rank, candidate in enumerate(ranked, start=1):
+            strengths, weaknesses, evidence = details[candidate.algorithm_id]
+            recommended = rank == 1
+            final_candidates.append(replace(candidate, recommended=recommended))
             recommendations.append(
                 Recommendation(
-                    algorithm_id=descriptor.id,
-                    algorithm_name=descriptor.name,
-                    score=score,
-                    rank=0,
-                    rationale=self._build_rationale(descriptor, score, strengths, weaknesses),
+                    algorithm_id=candidate.algorithm_id,
+                    algorithm_name=candidate.algorithm_name,
+                    score=candidate.recommendation_score,
+                    rank=rank,
+                    rationale=self._build_rationale(candidate, strengths, weaknesses),
                     strengths=tuple(strengths),
                     weaknesses=tuple(weaknesses),
                     evidence=tuple(evidence),
                 )
             )
 
-        scored_candidates = []
-        for recommendation in recommendations:
-            direct_support = 0 if any("direct support" in strength.lower() for strength in recommendation.strengths) else 1
-            structural_priority = self._structural_priority(problem, recommendation.algorithm_id)
-            scored_candidates.append((recommendation.score, structural_priority, direct_support, recommendation.algorithm_id, recommendation))
-
-        ranked = sorted(scored_candidates, key=lambda item: (-item[0], item[1], item[2], item[3]))
-        ranked_recommendations = []
-        for index, (_, _, _, _, recommendation) in enumerate(ranked, start=1):
-            ranked_recommendations.append(
-                Recommendation(
-                    algorithm_id=recommendation.algorithm_id,
-                    algorithm_name=recommendation.algorithm_name,
-                    score=recommendation.score,
-                    rank=index,
-                    rationale=recommendation.rationale,
-                    strengths=recommendation.strengths,
-                    weaknesses=recommendation.weaknesses,
-                    evidence=recommendation.evidence,
-                )
-            )
-
-        explanation = self._build_result_explanation(problem, ranked_recommendations, excluded_algorithms)
         return RecommendationResult(
-            recommendations=ranked_recommendations,
-            excluded_algorithms=excluded_algorithms,
-            explanation=explanation,
+            candidates=final_candidates,
+            recommendations=recommendations,
+            excluded_algorithms=excluded,
+            explanation=(
+                f"{len(final_candidates)} executable algorithms are compatible with {problem.name}. "
+                "Recommendation score is structural suitability, not an empirical performance benchmark. "
+                "The user remains responsible for the final algorithm selection."
+            ),
         )
 
-
-    def _structural_priority(self, problem: OptimizationProblem, algorithm_id: str) -> int:
-        properties = set(problem.mathematical_properties)
-        if {MathematicalProperty.INTEGER, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED}.issubset(properties):
-            order = {"integer_programming": 0, "constraint_programming": 1, "ga": 2}
-            return order.get(algorithm_id, 3)
-        if {MathematicalProperty.CONTINUOUS, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED}.issubset(properties):
-            order = {"linear_programming": 0, "pso": 2, "de": 3, "ga": 4}
-            return order.get(algorithm_id, 5)
-        return 0
-
-    def _score_candidate(
-        self,
-        problem: OptimizationProblem,
-        descriptor: AlgorithmDescriptor,
-        compatibility: object,
-    ) -> Tuple[float, List[str], List[str], List[str]]:
+    def _score_candidate(self, problem, descriptor, compatibility):
         capability = descriptor.get_capability(problem.solution_representation.kind if problem.solution_representation else None)
-        representation_supported = capability is not None and capability.status == "supported"
-        representation_supports_adapter = capability is not None and capability.status == "supported_with_adapter"
-
-        problem_variables = problem.variables or []
-        variable_types_match = all(variable.variable_type in descriptor.supported_variable_types for variable in problem_variables)
-
-        problem_properties = set(problem.mathematical_properties)
-        if not problem_properties:
-            problem_properties = {MathematicalProperty.UNCONSTRAINED}
-
-        matched_properties = [prop for prop in problem_properties if prop in descriptor.supported_mathematical_properties]
-        mathematical_property_match = len(matched_properties) / max(1, len(problem_properties))
-
+        direct = capability is not None and capability.status == "supported"
+        adapted = capability is not None and capability.status == "supported_with_adapter"
+        variable_match = all(v.variable_type in descriptor.supported_variable_types for v in problem.variables)
+        properties = set(problem.mathematical_properties) or {MathematicalProperty.UNCONSTRAINED}
+        matched = [prop for prop in properties if prop in descriptor.supported_mathematical_properties]
+        property_match = len(matched) / max(1, len(properties))
         family_match = problem.problem_family in descriptor.supported_problem_families
         constraints_present = bool(problem.constraints)
         constraints_supported = descriptor.supports_constraints if constraints_present else None
         objective_match = self._objective_match(problem, descriptor)
-        compatibility_is_direct = compatibility.status == CompatibilityStatus.COMPATIBLE
         score = self.scoring_policy.score(
-            representation_supported=representation_supported,
-            representation_supports_adapter=representation_supports_adapter,
+            representation_supported=direct,
+            representation_supports_adapter=adapted,
             family_match=family_match,
-            variable_types_match=variable_types_match,
-            mathematical_property_match=mathematical_property_match,
+            variable_types_match=variable_match,
+            mathematical_property_match=property_match,
             constraints_supported=constraints_supported,
             constraints_present=constraints_present,
             objective_match=objective_match,
-            compatibility_is_direct=compatibility_is_direct,
-            algorithm_id=descriptor.id,
-            problem_family=problem.problem_family,
-            representation=problem.solution_representation.kind if problem.solution_representation else None,
+            compatibility_status=compatibility.status,
         )
-
-        strengths: List[str] = []
-        weaknesses: List[str] = []
-        evidence: List[str] = []
-
-        if representation_supported:
-            strengths.append("direct support for the declared solution representation")
-        elif representation_supports_adapter:
-            strengths.append("supports the representation with adaptation")
-            weaknesses.append("requires adaptation for the target representation")
-        else:
-            weaknesses.append("does not natively support the required representation")
-
-        if family_match:
-            strengths.append(f"matches the problem family '{problem.problem_family.value}'")
-        else:
-            weaknesses.append("does not declare strong family specialization for this problem")
-
-        if variable_types_match:
-            strengths.append("supports the problem variable types")
-        else:
-            weaknesses.append("does not support all declared variable types")
-
-        if matching_properties := [prop.value for prop in matched_properties]:
-            strengths.append(f"covers mathematical properties: {', '.join(matching_properties)}")
-        else:
-            weaknesses.append("does not cover the problem mathematical properties")
-
-        if constraints_present and descriptor.supports_constraints:
-            strengths.append("supports constraint handling")
-        elif constraints_present:
-            weaknesses.append("does not declare constraint support")
-
-        if objective_match:
-            strengths.append("supports the declared objective semantics")
-        else:
-            weaknesses.append("does not fully support the declared objective semantics")
-
-        if compatibility_is_direct:
-            evidence.append("Compatibility status: compatible")
-        else:
-            evidence.append("Compatibility status: compatible_with_adaptation")
-            strengths.append("remains viable through adaptation")
-
-        if problem.problem_family == ProblemFamily.CONTINUOUS_OPTIMIZATION and problem.solution_representation and problem.solution_representation.kind == SolutionRepresentationKind.VECTOR:
-            evidence.append("Structural fit favors continuous vector search")
-
-        if not weaknesses:
-            weaknesses.append("structural suitability does not guarantee empirical performance")
-
-        evidence.append(f"Computed score: {score:.2f}")
+        score = min(1.0, score + descriptor.recommendation_priority)
+        strengths, weaknesses, evidence = [], [], []
+        strengths.append("direct support for the declared solution representation" if direct else "supports the representation through a declared adapter")
+        if family_match: strengths.append("matches the problem family")
+        if variable_match: strengths.append("supports the declared variable types")
+        if matched: strengths.append("covers declared mathematical properties: " + ", ".join(prop.value for prop in matched))
+        if constraints_present and descriptor.supports_constraints: strengths.append("supports constraint handling")
+        if objective_match: strengths.append("supports the declared objective semantics")
+        if not variable_match: weaknesses.append("does not natively cover every variable type")
+        if constraints_present and not descriptor.supports_constraints: weaknesses.append("does not declare constraint support")
+        if not objective_match: weaknesses.append("does not fully match the objective semantics")
+        if adapted: weaknesses.append("requires representation adaptation")
+        if not weaknesses: weaknesses.append("structural fit does not imply empirical superiority")
+        evidence.append(f"Compatibility status: {compatibility.status.value}")
+        evidence.append(f"Structural recommendation score: {score:.2f}")
         return score, strengths, weaknesses, evidence
 
-    def _objective_match(self, problem: OptimizationProblem, descriptor: AlgorithmDescriptor) -> bool:
-        if problem.objective is None:
+    @staticmethod
+    def _objective_match(problem, descriptor) -> bool:
+        objective = problem.objective
+        if objective is None:
             return False
-        if problem.objective.kind == ObjectiveKind.MULTI:
-            return descriptor.supports_multiobjective and problem.objective.sense in descriptor.supported_objectives
-        return problem.objective.sense in descriptor.supported_objectives
+        if objective.kind == ObjectiveKind.MULTI:
+            return descriptor.supports_multiobjective and objective.sense in descriptor.supported_objectives
+        if objective.sense not in descriptor.supported_objectives:
+            return False
+        if objective.metric is not None and descriptor.supported_objective_metrics:
+            metric = getattr(objective.metric, "value", objective.metric)
+            return metric in {getattr(item, "value", item) for item in descriptor.supported_objective_metrics}
+        return True
 
-    def _build_rationale(
-        self,
-        descriptor: AlgorithmDescriptor,
-        score: float,
-        strengths: Sequence[str],
-        weaknesses: Sequence[str],
-    ) -> str:
-        strong_points = "; ".join(strengths[:3])
-        weak_points = "; ".join(weaknesses[:2])
-        if weak_points:
-            return f"{descriptor.name} received a structural score of {score:.2f} because {strong_points}; limitations include {weak_points}."
-        return f"{descriptor.name} received a structural score of {score:.2f} because {strong_points}."
-
-    def _build_result_explanation(
-        self,
-        problem: OptimizationProblem,
-        recommendations: Sequence[Recommendation],
-        excluded_algorithms: Sequence[ExcludedAlgorithm],
-    ) -> str:
-        recommended = ", ".join(rec.algorithm_id for rec in recommendations) or "none"
-        excluded = ", ".join(ex.algorithm_id for ex in excluded_algorithms) or "none"
-        return (
-            f"RecommendationEngine evaluated {problem.name} using compatibility filtering and deterministic structural scoring. "
-            f"Recommended algorithms: {recommended}. Excluded algorithms: {excluded}."
-        )
-
-    def _availability_reason(self, availability: AlgorithmAvailability) -> str:
-        return {
-            AlgorithmAvailability.UNAVAILABLE: "algorithm is currently marked unavailable",
-            AlgorithmAvailability.PLANNED: "algorithm is planned but not yet executable",
-            AlgorithmAvailability.EXTERNAL: "algorithm is external and not part of the local executable set",
-        }.get(availability, "algorithm is not available for execution")
-
-    def _incompatibility_reason(self, problem: OptimizationProblem, compatibility: object) -> str:
-        if compatibility.reasons:
-            return "; ".join(compatibility.reasons)
-        return "algorithm is incompatible with the problem"
+    @staticmethod
+    def _build_rationale(candidate, strengths, weaknesses) -> str:
+        reason = "; ".join(strengths[:3]) or "matches the declared capabilities"
+        limitation = "; ".join(weaknesses[:2])
+        return f"{candidate.algorithm_name} is structurally suitable because {reason}." + (f" Limitations: {limitation}." if limitation else "")

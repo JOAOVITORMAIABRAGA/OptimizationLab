@@ -7,6 +7,19 @@ const emptyForm: ProblemForm = { name: '', description: '', problem_family: 'gen
 
 type Mode = 'ai' | 'advanced'
 
+function renderValue(value: unknown): string {
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value)
+  }
+
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return String(value)
+  }
+}
+
 function App() {
   const [mode, setMode] = useState<Mode>('ai')
   const [description, setDescription] = useState('')
@@ -120,7 +133,7 @@ function App() {
         <section className="card"><div className="section-head"><span className="step">05</span><div><h2>Compatible algorithms</h2><p>{result.validation.valid ? `${compatibleCount} executable candidate${compatibleCount===1?'':'s'} passed capability matching. Compatibility is independent from recommendation.` : `${compatibleCount} algorithm${compatibleCount===1?'':'s'} match the declared capabilities, but execution is blocked until the validation errors are resolved.`}</p></div></div><div className="algorithm-grid">{result.compatibility.map(a=><article className={`algorithm ${a.status==='incompatible'?'bad':''}`} key={a.algorithm_id}><div className="algo-top"><strong>{a.algorithm_name}</strong>{a.status==='incompatible'?<X/>:<Check/>}</div><span className="badge">{a.status.replaceAll('_',' ')}</span>{a.target_representation&&<div className="message">Adapted target: {a.target_representation}</div>}{a.reasons.length>0&&<ul>{a.reasons.slice(0,3).map(r=><li key={r}>{r}</li>)}</ul>}</article>)}</div></section>
         <section className="card recommendations"><div className="section-head"><span className="step">06</span><div><h2>Choose an algorithm</h2><p><Sparkles size={15}/> The first candidate is recommended by structural fit, but the final choice is yours.</p></div></div>{result.candidates.length===0?<div className="empty">No executable compatible algorithms are available.</div>:<div className="algorithm-grid">{result.candidates.map(c=><article className={`recommendation ${selectedAlgorithm===c.algorithm_id?'selected':''}`} key={c.algorithm_id} onClick={()=>{setSelectedAlgorithm(c.algorithm_id);setSolution(null)}} role="button" tabIndex={0} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setSelectedAlgorithm(c.algorithm_id);setSolution(null)}}}><div className="rank">{c.recommended?'★':`#${result.recommendations.find(r=>r.algorithm_id===c.algorithm_id)?.rank ?? '–'}`}</div><div className="rec-body"><div className="rec-title"><strong>{c.algorithm_name}</strong><b>{c.recommendation_score.toFixed(2)}</b></div><p>{c.recommended?'Recommended by structural fit.':'Compatible candidate — available for manual selection.'}</p><div className="evidence"><span>{c.compatibility.replaceAll('_',' ')}</span><span>{c.algorithm_type}</span><span>cost: {c.estimated_cost}</span>{c.adaptation.map(a=><span key={a}>adapter: {a}</span>)}</div></div></article>)}</div>}</section>
         {result.validation.valid && result.candidates.length > 0 && !solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Selected algorithm: <strong>{result.candidates.find(c=>c.algorithm_id===selectedAlgorithm)?.algorithm_name ?? selectedAlgorithm}</strong>. You can change the selection above at any time.</p></div></div><div className="result success"><Check/><div><strong>{selectedAlgorithm ? 'Ready to solve' : 'Select an algorithm'}</strong><div className="message">No automatic execution will occur unless you choose a candidate.</div></div></div><button className="primary" onClick={solveSelected} disabled={loading || !selectedAlgorithm}>{loading?'Solving…':'Solve selected algorithm'}<ArrowRight size={18}/></button></section>}
-        {solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Returned by the selected executable solver.</p></div></div><div className="result success"><Check/><div><strong>Solution found</strong><div className="message">Algorithm: {solution.algorithm_id}</div><div className="message">Objective value: {solution.objective_value}</div></div></div><div className="variable-list">{Object.entries(solution.variable_values).map(([name,value])=><div className="variable" key={name}><strong>{name}</strong><span>{value}</span></div>)}</div><pre className="json">{JSON.stringify(solution.parameters,null,2)}</pre></section>}
+        {solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Returned by the selected executable solver.</p></div></div><div className="result success"><Check/><div><strong>Solution found</strong><div className="message">Algorithm: {solution.algorithm_id}</div><div className="message">Objective value: {solution.objective_value}</div></div></div><div className="variable-list">{Object.entries(solution.variable_values).map(([name,value])=><div className="variable" key={name}><strong>{name}</strong><span>{renderValue(value)}</span></div>)}</div><pre className="json">{JSON.stringify(solution.parameters,null,2)}</pre></section>}
       </>}
     </main><footer>Optimization Lab · AI model · validate · recommend · solve</footer>
   </div>

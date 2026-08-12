@@ -116,9 +116,10 @@ def test_classical_solvers_are_the_explicit_exact_integer_binary_backends():
 
 def test_aco_is_honest_about_graph_and_permutation_support():
     aco = AlgorithmRegistry.from_builtin_algorithms().get("aco")
-    assert aco.get_capability(SolutionRepresentationKind.GRAPH) is None or aco.get_capability(SolutionRepresentationKind.GRAPH).status == "unsupported"
-    assert aco.get_capability(SolutionRepresentationKind.PERMUTATION) is None or aco.get_capability(SolutionRepresentationKind.PERMUTATION).status == "unsupported"
-    assert aco.get_capability(SolutionRepresentationKind.VECTOR).status == "supported"
+    assert aco.get_capability(SolutionRepresentationKind.GRAPH).status == "supported_with_adapter"
+    assert aco.get_capability(SolutionRepresentationKind.GRAPH).required_adapters == ("graph_to_permutation",)
+    assert aco.get_capability(SolutionRepresentationKind.PERMUTATION).status == "supported"
+    assert aco.get_capability(SolutionRepresentationKind.VECTOR).status == "unsupported"
 
 
 def test_operator_registry_is_runtime_source_of_truth():

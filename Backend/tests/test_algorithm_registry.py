@@ -58,17 +58,9 @@ def build_descriptor(**overrides):
 def test_all_existing_algorithms_can_be_found_by_id():
     registry = AlgorithmRegistry.from_builtin_algorithms()
     expected_ids = {
-        "ga",
-        "pso",
-        "de",
-        "bfo",
-        "sa",
-        "aco",
-        "tabu",
-        "hill_climbing",
-        "linear_programming",
-        "integer_programming",
-        "constraint_programming",
+        "ga", "pso", "de", "bfo", "sa", "aco", "tabu", "hill_climbing",
+        "chinese_postman", "shortest_path", "minimum_spanning_tree",
+        "linear_programming", "integer_programming", "constraint_programming",
     }
     assert set(registry.get_all_ids()) == expected_ids
 
@@ -167,7 +159,7 @@ def test_classical_algorithms_are_available_when_real_backends_exist():
 
 def test_registry_can_list_all_algorithms():
     registry = AlgorithmRegistry.from_builtin_algorithms()
-    assert len(registry.get_all()) == 11
+    assert len(registry.get_all()) == 14
 
 
 def test_registry_can_filter_by_representation():
@@ -190,15 +182,21 @@ def test_ga_descriptor_reflects_current_implementation_state():
     vector_capability = ga.get_capability(SolutionRepresentationKind.VECTOR)
     permutation_capability = ga.get_capability(SolutionRepresentationKind.PERMUTATION)
     assert vector_capability is not None and vector_capability.status == "supported"
-    assert permutation_capability is not None and permutation_capability.status == "unsupported"
+    assert permutation_capability is not None and permutation_capability.status == "supported"
+    graph_capability = ga.get_capability(SolutionRepresentationKind.GRAPH)
+    assert graph_capability is not None and graph_capability.status == "supported_with_adapter"
+    assert graph_capability.required_adapters == ("graph_to_permutation",)
     assert "crossover" in ga.required_operators and "mutation" in ga.required_operators
     assert ga.availability == AlgorithmAvailability.AVAILABLE
 
 
-def test_aco_descriptor_is_conservative_about_representation_support():
+def test_aco_descriptor_supports_permutation_and_not_graph_or_vector():
     registry = AlgorithmRegistry.from_builtin_algorithms()
     aco = registry.get("aco")
     graph_capability = aco.get_capability(SolutionRepresentationKind.GRAPH)
     permutation_capability = aco.get_capability(SolutionRepresentationKind.PERMUTATION)
-    assert graph_capability is None or graph_capability.status == "unsupported"
-    assert permutation_capability is None or permutation_capability.status == "unsupported"
+    vector_capability = aco.get_capability(SolutionRepresentationKind.VECTOR)
+    assert graph_capability is not None and graph_capability.status == "supported_with_adapter"
+    assert graph_capability.required_adapters == ("graph_to_permutation",)
+    assert permutation_capability is not None and permutation_capability.status == "supported"
+    assert vector_capability is not None and vector_capability.status == "unsupported"

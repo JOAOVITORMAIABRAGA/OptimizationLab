@@ -1,0 +1,5 @@
+edge_id,from,to,distance
+AB,A,B,1
+BC,B,C,1
+CA,C,A,1
+CD,C,D,1

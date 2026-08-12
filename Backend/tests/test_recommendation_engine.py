@@ -72,17 +72,18 @@ def test_continuous_problem_with_pso_remains_highly_recommended(engine):
     assert pso.rank >= 1
 
 
-def test_tsp_problem_has_no_executable_recommendations(engine):
+def test_tsp_problem_recommends_aco(engine):
     problem = make_problem(
         representation=SolutionRepresentationKind.PERMUTATION,
-        variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))],
+        variables=[VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3])) for i in range(4)],
         family=ProblemFamily.ROUTING,
         properties={MathematicalProperty.COMBINATORIAL},
     )
     registry = AlgorithmRegistry.from_builtin_algorithms()
     result = engine.recommend(problem, registry)
 
-    assert result.recommendations == []
+    assert result.recommendations
+    assert result.recommendations[0].algorithm_id == "aco"
     assert any(excluded.algorithm_id == "pso" for excluded in result.excluded_algorithms)
     assert any(excluded.algorithm_id == "ga" for excluded in result.excluded_algorithms)
 

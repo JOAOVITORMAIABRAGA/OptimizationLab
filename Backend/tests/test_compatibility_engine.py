@@ -89,7 +89,7 @@ def test_binary_problem_with_algorithm_without_binary_support_is_incompatible(en
 
 
 def test_permutation_problem_with_pso_is_incompatible(engine):
-    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))])
+    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3])) for i in range(4)])
     from algorithms.registry import AlgorithmRegistry
 
     registry = AlgorithmRegistry.from_builtin_algorithms()
@@ -98,7 +98,7 @@ def test_permutation_problem_with_pso_is_incompatible(engine):
 
 
 def test_permutation_problem_with_ga_is_incompatible(engine):
-    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))])
+    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3])) for i in range(4)])
     from algorithms.registry import AlgorithmRegistry
 
     registry = AlgorithmRegistry.from_builtin_algorithms()
@@ -106,13 +106,22 @@ def test_permutation_problem_with_ga_is_incompatible(engine):
     assert result.status == CompatibilityStatus.INCOMPATIBLE
 
 
-def test_permutation_problem_with_aco_is_incompatible(engine):
-    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))])
+def test_permutation_problem_with_aco_is_compatible(engine):
+    variables = [
+        VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))
+        for i in range(4)
+    ]
+    problem = make_problem(
+        representation=SolutionRepresentationKind.PERMUTATION,
+        variables=variables,
+        family=ProblemFamily.ROUTING,
+        properties={MathematicalProperty.COMBINATORIAL, MathematicalProperty.DISCRETE, MathematicalProperty.CONSTRAINED},
+    )
     from algorithms.registry import AlgorithmRegistry
 
     registry = AlgorithmRegistry.from_builtin_algorithms()
     result = engine.check(problem, registry.get("aco"))
-    assert result.status == CompatibilityStatus.INCOMPATIBLE
+    assert result.status == CompatibilityStatus.COMPATIBLE
 
 
 def test_graph_problem_with_aco_is_incompatible(engine):
@@ -243,7 +252,7 @@ def test_adapter_available_is_compatible_with_adaptation(engine):
         implementation_class=None,
         availability=AlgorithmAvailability.UNAVAILABLE,
     )
-    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))], family=ProblemFamily.ROUTING, properties={MathematicalProperty.COMBINATORIAL})
+    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3])) for i in range(4)], family=ProblemFamily.ROUTING, properties={MathematicalProperty.COMBINATORIAL})
     result = engine.check(problem, descriptor, available_adapters={"permutation_adapter"})
     assert result.status == CompatibilityStatus.COMPATIBLE_WITH_ADAPTATION
 
@@ -267,7 +276,7 @@ def test_adapter_missing_is_incompatible(engine):
         implementation_class=None,
         availability=AlgorithmAvailability.UNAVAILABLE,
     )
-    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name="route", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3]))], family=ProblemFamily.ROUTING, properties={MathematicalProperty.COMBINATORIAL})
+    problem = make_problem(representation=SolutionRepresentationKind.PERMUTATION, variables=[VariableSpec(name=f"p{i}", variable_type=VariableType.DISCRETE, domain=DomainSpec(kind="permutation", values=[0, 1, 2, 3])) for i in range(4)], family=ProblemFamily.ROUTING, properties={MathematicalProperty.COMBINATORIAL})
     result = engine.check(problem, descriptor)
     assert result.status == CompatibilityStatus.INCOMPATIBLE
 

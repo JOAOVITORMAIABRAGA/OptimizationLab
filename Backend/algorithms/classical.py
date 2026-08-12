@@ -1,80 +1,59 @@
-import numpy as np
-from typing import Callable, Tuple, List, Dict, Any
-from .base import OptimizationAlgorithm
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+
 from schemas import AlgorithmConfig
+from .base import OptimizationAlgorithm
+from adapters.solver_adapter import OptimizationProblemAdapter, OrToolsConstraintProgrammingAdapter, ScipyLinearProgrammingAdapter, ScipyMixedIntegerAdapter, cp_model
+from domain.problem import OptimizationProblem
+from domain.variables import VariableType
 
 
-class LinearProgramming(OptimizationAlgorithm):
-    def __init__(self):
-        self.max_iter: int = 100
+class _ClassicalSolver(OptimizationAlgorithm):
+    def __init__(self) -> None:
+        self.adapter = OptimizationProblemAdapter()
+        self.last_backend = ""
 
-    def configure(self, config: AlgorithmConfig) -> None:
-        pass
+    def configure(self, config: Optional[AlgorithmConfig]) -> None:
+        return None
 
-    def optimize(
-        self,
-        fitness_function: Callable,
-        bounds: List[Tuple[float, float]],
-        is_minimization: bool = True,
-        constraints: List[Callable] = None,
-    ) -> Tuple[List[float], float]:
-        rng = np.random.default_rng(41)
-        candidate = np.array([rng.uniform(low, high) for low, high in bounds], dtype=float)
-        value = float(fitness_function(candidate.tolist()))
-        return candidate.tolist(), value
+    def _solve_problem(self, problem: OptimizationProblem) -> Tuple[List[float], float]:
+        model = self.adapter.build(problem)
+        return self._solve_model(model)
 
-    def get_params_report(self) -> Dict[str, Any]:
-        return {"engine": "Linear Programming (heuristic fallback)"}
-
-
-class IntegerProgramming(OptimizationAlgorithm):
-    def __init__(self):
-        self.max_iter: int = 100
-
-    def configure(self, config: AlgorithmConfig) -> None:
-        pass
-
-    def optimize(
-        self,
-        fitness_function: Callable,
-        bounds: List[Tuple[float, float]],
-        is_minimization: bool = True,
-        constraints: List[Callable] = None,
-    ) -> Tuple[List[float], float]:
-        rng = np.random.default_rng(43)
-        candidate = np.array([round(rng.uniform(low, high)) for low, high in bounds], dtype=float)
-        value = float(fitness_function(candidate.tolist()))
-        return candidate.tolist(), value
+    def optimize(self, problem: OptimizationProblem, bounds=None, is_minimization=True, constraints=None) -> Tuple[List[float], float]:
+        if not isinstance(problem, OptimizationProblem):
+            raise TypeError(
+                f"{self.__class__.__name__} requires an OptimizationProblem. "
+                "Legacy fitness-function execution is intentionally unsupported for exact solvers."
+            )
+        return self._solve_problem(problem)
 
     def get_params_report(self) -> Dict[str, Any]:
-        return {"engine": "Integer Programming (heuristic fallback)"}
+        return {"engine": self.last_backend}
+
+    def _solve_model(self, model):
+        raise NotImplementedError
 
 
-class ConstraintProgramming(OptimizationAlgorithm):
-    def __init__(self):
-        self.max_iter: int = 100
+class LinearProgramming(_ClassicalSolver):
+    def _solve_model(self, model):
+        self.last_backend = "SciPy HiGHS linear programming"
+        return ScipyLinearProgrammingAdapter().solve(model)
 
-    def configure(self, config: AlgorithmConfig) -> None:
-        pass
 
-    def optimize(
-        self,
-        fitness_function: Callable,
-        bounds: List[Tuple[float, float]],
-        is_minimization: bool = True,
-        constraints: List[Callable] = None,
-    ) -> Tuple[List[float], float]:
-        rng = np.random.default_rng(47)
-        candidate = np.array([rng.uniform(low, high) for low, high in bounds], dtype=float)
-        if constraints:
-            for _ in range(20):
-                for constraint_func in constraints:
-                    if not constraint_func(candidate.tolist()):
-                        candidate += rng.normal(0.0, 0.1, size=len(bounds))
-                        candidate = np.clip(candidate, [b[0] for b in bounds], [b[1] for b in bounds])
-                        break
-        value = float(fitness_function(candidate.tolist()))
-        return candidate.tolist(), value
+class IntegerProgramming(_ClassicalSolver):
+    def _solve_model(self, model):
+        self.last_backend = "SciPy HiGHS mixed-integer linear programming"
+        return ScipyMixedIntegerAdapter().solve(model)
 
-    def get_params_report(self) -> Dict[str, Any]:
-        return {"engine": "Constraint Programming (heuristic fallback)"}
+
+class ConstraintProgramming(_ClassicalSolver):
+    def _solve_model(self, model):
+        if any(value == 0 for value in model.integrality):
+            raise ValueError("ConstraintProgramming backend currently requires integer/binary variables.")
+        if cp_model is not None:
+            self.last_backend = "OR-Tools CP-SAT"
+            return OrToolsConstraintProgrammingAdapter().solve(model)
+        self.last_backend = "SciPy HiGHS exact mixed-integer constraint backend"
+        return ScipyMixedIntegerAdapter().solve(model)

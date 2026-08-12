@@ -76,6 +76,7 @@ class AlgorithmDescriptor:
     limitations: Tuple[str, ...]
     implementation_class: Optional[Type[OptimizationAlgorithm]] = None
     availability: AlgorithmAvailability = AlgorithmAvailability.AVAILABLE
+    required_mathematical_properties: Tuple[MathematicalProperty, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         if not self.id or not self.name or not self.description:
@@ -159,6 +160,16 @@ class AlgorithmRegistry:
         if descriptor.availability == AlgorithmAvailability.AVAILABLE and descriptor.implementation_class is None:
             return False
         return True
+
+    @staticmethod
+    def validate_implementation(implementation_class: Type[OptimizationAlgorithm]) -> bool:
+        try:
+            if not isinstance(implementation_class, type) or not issubclass(implementation_class, OptimizationAlgorithm):
+                return False
+            instance = implementation_class()
+            return callable(getattr(instance, "configure", None)) and callable(getattr(instance, "optimize", None)) and callable(getattr(instance, "get_params_report", None))
+        except Exception:
+            return False
 
     def validate(self) -> List[str]:
         errors: List[str] = []
@@ -483,84 +494,87 @@ class AlgorithmRegistry:
             AlgorithmDescriptor(
                 id="linear_programming",
                 name="Linear Programming",
-                description="Placeholder wrapper that currently behaves as a heuristic fallback rather than a real LP solver.",
+                description="Exact linear programming solver backed by SciPy HiGHS.",
                 representation_capabilities=(
                     RepresentationCapability(
                         representation=SolutionRepresentationKind.VECTOR,
-                        status="unsupported",
-                        required_operators=("linear_solver",),
-                        required_adapters=("scipy_lp",),
-                        notes="The current implementation is a heuristic fallback and does not use a real LP solver backend.",
+                        status="supported",
+                        required_operators=(),
+                        required_adapters=(),
+                        notes="Translates the structured optimization model to scipy.optimize.linprog (HiGHS).",
                     ),
                 ),
                 supported_variable_types=(VariableType.CONTINUOUS,),
-                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.GENERIC),
+                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.PRODUCTION_PLANNING, ProblemFamily.RESOURCE_ALLOCATION, ProblemFamily.GENERIC),
                 supported_mathematical_properties=(MathematicalProperty.CONTINUOUS, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED),
-                supported_objectives=("minimize", "maximize"),
+                supported_objectives=(ObjectiveSense.MINIMIZE, ObjectiveSense.MAXIMIZE),
                 supports_constraints=True,
                 supports_multiobjective=False,
-                required_operators=("linear_solver",),
+                required_operators=(),
                 optional_operators=(),
-                required_adapters=("scipy_lp",),
-                limitations=("No genuine LP backend is present; this is currently an unavailable/planned integration.",),
-                implementation_class="LinearProgramming",
-                availability=AlgorithmAvailability.UNAVAILABLE,
+                required_adapters=(),
+                limitations=("Current backend supports affine expressions and hard linear constraints only.",),
+                implementation_class=LinearProgramming,
+                availability=AlgorithmAvailability.AVAILABLE,
+                required_mathematical_properties=(MathematicalProperty.LINEAR,),
             )
         )
         registry.register(
             AlgorithmDescriptor(
                 id="integer_programming",
                 name="Integer Programming",
-                description="Placeholder wrapper that currently behaves as a heuristic fallback rather than a real IP solver.",
+                description="Exact mixed-integer linear programming solver backed by SciPy HiGHS.",
                 representation_capabilities=(
                     RepresentationCapability(
                         representation=SolutionRepresentationKind.VECTOR,
-                        status="unsupported",
-                        required_operators=("integer_solver",),
-                        required_adapters=("mip_solver",),
-                        notes="The current implementation only rounds random values and does not exercise a real integer solver.",
+                        status="supported",
+                        required_operators=(),
+                        required_adapters=(),
+                        notes="Translates integer/binary/continuous affine models to scipy.optimize.milp (HiGHS).",
                     ),
                 ),
-                supported_variable_types=(VariableType.INTEGER,),
-                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.GENERIC),
-                supported_mathematical_properties=(MathematicalProperty.INTEGER, MathematicalProperty.CONSTRAINED),
-                supported_objectives=("minimize", "maximize"),
+                supported_variable_types=(VariableType.CONTINUOUS, VariableType.INTEGER, VariableType.BINARY),
+                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.PRODUCTION_PLANNING, ProblemFamily.RESOURCE_ALLOCATION, ProblemFamily.GENERIC),
+                supported_mathematical_properties=(MathematicalProperty.CONTINUOUS, MathematicalProperty.INTEGER, MathematicalProperty.BINARY, MathematicalProperty.DISCRETE, MathematicalProperty.MIXED_INTEGER, MathematicalProperty.LINEAR, MathematicalProperty.CONSTRAINED),
+                supported_objectives=(ObjectiveSense.MINIMIZE, ObjectiveSense.MAXIMIZE),
                 supports_constraints=True,
                 supports_multiobjective=False,
-                required_operators=("integer_solver",),
+                required_operators=(),
                 optional_operators=(),
-                required_adapters=("mip_solver",),
-                limitations=("No real IP backend is present; this is currently an unavailable/planned integration.",),
-                implementation_class="IntegerProgramming",
-                availability=AlgorithmAvailability.UNAVAILABLE,
+                required_adapters=(),
+                limitations=("Current backend supports affine expressions and hard linear constraints only; multiobjective execution is not implemented.",),
+                implementation_class=IntegerProgramming,
+                availability=AlgorithmAvailability.AVAILABLE,
+                required_mathematical_properties=(MathematicalProperty.LINEAR, MathematicalProperty.INTEGER),
             )
         )
         registry.register(
             AlgorithmDescriptor(
                 id="constraint_programming",
                 name="Constraint Programming",
-                description="Placeholder wrapper that currently behaves as a heuristic fallback rather than a real CP solver.",
+                description="Exact integer constraint solver backed by SciPy HiGHS mixed-integer optimization.",
                 representation_capabilities=(
                     RepresentationCapability(
                         representation=SolutionRepresentationKind.VECTOR,
-                        status="unsupported",
-                        required_operators=("constraint_solver",),
-                        required_adapters=("cp_solver",),
-                        notes="The current implementation only perturbs candidate solutions around constraints and is not a real CP engine.",
+                        status="supported",
+                        required_operators=(),
+                        required_adapters=(),
+                        notes="Uses an exact mixed-integer backend for bounded linear integer/binary constraint models.",
                     ),
                 ),
-                supported_variable_types=(VariableType.CONTINUOUS, VariableType.INTEGER, VariableType.BINARY),
-                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.GENERIC),
-                supported_mathematical_properties=(MathematicalProperty.CONSTRAINED, MathematicalProperty.DISCRETE),
-                supported_objectives=("minimize", "maximize"),
+                supported_variable_types=(VariableType.INTEGER, VariableType.BINARY),
+                supported_problem_families=(ProblemFamily.CONTINUOUS_OPTIMIZATION, ProblemFamily.PRODUCTION_PLANNING, ProblemFamily.RESOURCE_ALLOCATION, ProblemFamily.GENERIC),
+                supported_mathematical_properties=(MathematicalProperty.INTEGER, MathematicalProperty.BINARY, MathematicalProperty.DISCRETE, MathematicalProperty.CONSTRAINED, MathematicalProperty.LINEAR),
+                supported_objectives=(ObjectiveSense.MINIMIZE, ObjectiveSense.MAXIMIZE),
                 supports_constraints=True,
                 supports_multiobjective=False,
-                required_operators=("constraint_solver",),
+                required_operators=(),
                 optional_operators=(),
-                required_adapters=("cp_solver",),
-                limitations=("No real CP backend is present; this is currently an unavailable/planned integration.",),
-                implementation_class="ConstraintProgramming",
-                availability=AlgorithmAvailability.UNAVAILABLE,
+                required_adapters=(),
+                limitations=("This CP-compatible backend currently targets bounded linear integer/binary models; CP-SAT is not bundled in the runtime image.",),
+                implementation_class=ConstraintProgramming,
+                availability=AlgorithmAvailability.AVAILABLE,
+                required_mathematical_properties=(MathematicalProperty.CONSTRAINED, MathematicalProperty.INTEGER),
             )
         )
         return registry

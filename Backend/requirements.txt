@@ -7,3 +7,5 @@ numpy>=1.22.0
 pandas>=2.0.0
 python-dotenv>=1.0.0
 python-multipart>=0.0.9
+scipy>=1.11.0
+ortools>=9.10,<10

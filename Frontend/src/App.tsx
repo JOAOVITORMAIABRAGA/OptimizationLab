@@ -18,12 +18,13 @@ function App() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [solution, setSolution] = useState<SolveResult | null>(null)
+  const [selectedAlgorithm, setSelectedAlgorithm] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { metadata().then(setMeta).catch(() => {}) }, [])
 
   const updateVar = (i:number, patch:Partial<Variable>) => setForm(f=>({...f,variables:f.variables.map((v,j)=>j===i?{...v,...patch}:v)}))
-  const compatibleCount = useMemo(() => result?.compatibility.filter(x=>x.status!=='incompatible').length ?? 0,[result])
+  const compatibleCount = useMemo(() => result?.compatibility.filter(a=>a.status!=='incompatible').length ?? 0,[result])
 
   const runAI = async () => {
     if (!description.trim()) return setError('Describe the optimization problem first.')
@@ -39,6 +40,7 @@ function App() {
       const analysis = await analyze(normalized)
       setForm(normalized)
       setResult(analysis)
+      setSelectedAlgorithm(analysis.recommendations[0]?.algorithm_id ?? analysis.candidates[0]?.algorithm_id ?? '')
       return analysis
     } catch(e) {
       setError(e instanceof Error?e.message:'Request failed.')
@@ -60,9 +62,9 @@ function App() {
     await validateProblem(nextForm)
   }
 
-  const solveRecommended = async () => {
-    if (!result?.validation.valid || result.recommendations.length === 0) return
-    const algorithm = result.recommendations[0].algorithm_id
+  const solveSelected = async () => {
+    if (!result?.validation.valid || !selectedAlgorithm) return
+    const algorithm = selectedAlgorithm
     setLoading(true); setError('')
     try {
       setSolution(await solve(form, algorithm))
@@ -92,7 +94,7 @@ function App() {
       {aiModel && <section className="card ai-review">
         <div className="section-head"><span className="step">02</span><div><h2>AI-generated problem model</h2><p>Review how the AI interpreted your description and dataset before validation.</p></div></div>
         <div className="ai-summary"><Sparkles size={18}/><p>{aiModel.explanation}</p></div>
-        <div className="grid two"><div className="info"><span>Problem family</span><strong>{aiModel.problem.problem_family}</strong></div><div className="info"><span>Objective</span><strong>{aiModel.problem.objective_sense}{aiModel.problem.expression ? ` · ${aiModel.problem.expression}` : ' · Not yet determined'}</strong></div></div>
+        <div className="grid two"><div className="info"><span>Problem family</span><strong>{aiModel.problem.problem_family}</strong></div><div className="info"><span>Objective</span><strong>{aiModel.problem.objective_sense}{aiModel.problem.expression ? ` · ${aiModel.problem.expression}` : aiModel.problem.objective_metric ? ` · ${aiModel.problem.objective_metric}` : ' · Not yet determined'}</strong></div></div>
         <div className="grid two"><div className="info"><span>Decision variables</span><strong>{aiModel.problem.variables.length > 0 ? aiModel.problem.variables.map(v=>v.name).join(', ') : 'Not determined'}</strong></div><div className="info"><span>Model status</span><strong>{aiModel.incomplete ? 'Incomplete — needs review' : 'Complete proposal'}</strong></div></div>
         <div className="info"><span>Mathematical properties</span><div className="chips readonly">{aiModel.problem.mathematical_properties.map(p=><span className="chip active" key={p}>{p}</span>)}</div></div>
         <div className="dataset-card"><div><FileText size={17}/><strong>{aiModel.dataset.filename}</strong><span>{aiModel.dataset.row_count.toLocaleString()} rows · {aiModel.dataset.column_count} columns</span></div><small>{aiModel.dataset.columns.join(' · ')}</small></div>
@@ -115,10 +117,10 @@ function App() {
       {result&&<>
         <section className="card"><div className="section-head"><span className="step">03</span><div><h2>Validation</h2><p>Returned by the existing ValidationEngine.</p></div></div><div className={result.validation.valid?'result success':'result failure'}>{result.validation.valid?<Check/>:<X/>}<div><strong>{result.validation.valid?'Problem is valid':'Problem has validation errors'}</strong>{result.validation.errors.map(e=><div className="message" key={e}>• {e}</div>)}{result.validation.warnings.map(w=><div className="message warning" key={w}><AlertTriangle size={14}/> {w}</div>)}</div></div></section>
         <section className="card"><div className="section-head"><span className="step">04</span><div><h2>Structured problem</h2><p>What the user/AI proposed → how the domain understood it.</p></div></div><pre className="json">{JSON.stringify(result.problem,null,2)}</pre></section>
-        <section className="card"><div className="section-head"><span className="step">05</span><div><h2>Compatibility</h2><p>{compatibleCount} algorithm{compatibleCount===1?'':'s'} can work with this problem according to CompatibilityEngine.</p></div></div><div className="algorithm-grid">{result.compatibility.map(a=><article className={`algorithm ${a.status==='incompatible'?'bad':''}`} key={a.algorithm_id}><div className="algo-top"><strong>{a.algorithm_name}</strong>{a.status==='incompatible'?<X/>:<Check/>}</div><span className="badge">{a.status.replaceAll('_',' ')}</span>{a.reasons.length>0&&<ul>{a.reasons.slice(0,3).map(r=><li key={r}>{r}</li>)}</ul>}</article>)}</div></section>
-        <section className="card recommendations"><div className="section-head"><span className="step">06</span><div><h2>Recommendations</h2><p><Sparkles size={15}/> RecommendationEngine scoring — not empirical benchmark results.</p></div></div>{result.recommendations.length===0?<div className="empty">No compatible algorithms were recommended.</div>:result.recommendations.map(r=><article className="recommendation" key={r.algorithm_id}><div className="rank">#{r.rank}</div><div className="rec-body"><div className="rec-title"><strong>{r.algorithm_name}</strong><b>{r.score.toFixed(2)}</b></div><p>{r.rationale}</p><div className="evidence">{r.evidence.map(x=><span key={x}>{x}</span>)}</div></div></article>)}</section>
-        {result.validation.valid && result.recommendations.length > 0 && !solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Execute the top structurally recommended compatible algorithm.</p></div></div><div className="result success"><Check/><div><strong>{result.recommendations[0].algorithm_name}</strong><div className="message">The model is valid and an executable compatible solver is available.</div></div></div><button className="primary" onClick={solveRecommended} disabled={loading}>{loading?'Solving…':'Solve problem'}<ArrowRight size={18}/></button></section>}
-        {solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Returned by the selected executable solver.</p></div></div><div className="result success"><Check/><div><strong>Optimal solution found</strong><div className="message">Algorithm: {solution.algorithm_id}</div><div className="message">Objective value: {solution.objective_value}</div></div></div><div className="variable-list">{Object.entries(solution.variable_values).map(([name,value])=><div className="variable" key={name}><strong>{name}</strong><span>{value}</span></div>)}</div><pre className="json">{JSON.stringify(solution.parameters,null,2)}</pre></section>}
+        <section className="card"><div className="section-head"><span className="step">05</span><div><h2>Compatible algorithms</h2><p>{result.validation.valid ? `${compatibleCount} executable candidate${compatibleCount===1?'':'s'} passed capability matching. Compatibility is independent from recommendation.` : `${compatibleCount} algorithm${compatibleCount===1?'':'s'} match the declared capabilities, but execution is blocked until the validation errors are resolved.`}</p></div></div><div className="algorithm-grid">{result.compatibility.map(a=><article className={`algorithm ${a.status==='incompatible'?'bad':''}`} key={a.algorithm_id}><div className="algo-top"><strong>{a.algorithm_name}</strong>{a.status==='incompatible'?<X/>:<Check/>}</div><span className="badge">{a.status.replaceAll('_',' ')}</span>{a.target_representation&&<div className="message">Adapted target: {a.target_representation}</div>}{a.reasons.length>0&&<ul>{a.reasons.slice(0,3).map(r=><li key={r}>{r}</li>)}</ul>}</article>)}</div></section>
+        <section className="card recommendations"><div className="section-head"><span className="step">06</span><div><h2>Choose an algorithm</h2><p><Sparkles size={15}/> The first candidate is recommended by structural fit, but the final choice is yours.</p></div></div>{result.candidates.length===0?<div className="empty">No executable compatible algorithms are available.</div>:<div className="algorithm-grid">{result.candidates.map(c=><article className={`recommendation ${selectedAlgorithm===c.algorithm_id?'selected':''}`} key={c.algorithm_id} onClick={()=>{setSelectedAlgorithm(c.algorithm_id);setSolution(null)}} role="button" tabIndex={0} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setSelectedAlgorithm(c.algorithm_id);setSolution(null)}}}><div className="rank">{c.recommended?'★':`#${result.recommendations.find(r=>r.algorithm_id===c.algorithm_id)?.rank ?? '–'}`}</div><div className="rec-body"><div className="rec-title"><strong>{c.algorithm_name}</strong><b>{c.recommendation_score.toFixed(2)}</b></div><p>{c.recommended?'Recommended by structural fit.':'Compatible candidate — available for manual selection.'}</p><div className="evidence"><span>{c.compatibility.replaceAll('_',' ')}</span><span>{c.algorithm_type}</span><span>cost: {c.estimated_cost}</span>{c.adaptation.map(a=><span key={a}>adapter: {a}</span>)}</div></div></article>)}</div>}</section>
+        {result.validation.valid && result.candidates.length > 0 && !solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Selected algorithm: <strong>{result.candidates.find(c=>c.algorithm_id===selectedAlgorithm)?.algorithm_name ?? selectedAlgorithm}</strong>. You can change the selection above at any time.</p></div></div><div className="result success"><Check/><div><strong>{selectedAlgorithm ? 'Ready to solve' : 'Select an algorithm'}</strong><div className="message">No automatic execution will occur unless you choose a candidate.</div></div></div><button className="primary" onClick={solveSelected} disabled={loading || !selectedAlgorithm}>{loading?'Solving…':'Solve selected algorithm'}<ArrowRight size={18}/></button></section>}
+        {solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Returned by the selected executable solver.</p></div></div><div className="result success"><Check/><div><strong>Solution found</strong><div className="message">Algorithm: {solution.algorithm_id}</div><div className="message">Objective value: {solution.objective_value}</div></div></div><div className="variable-list">{Object.entries(solution.variable_values).map(([name,value])=><div className="variable" key={name}><strong>{name}</strong><span>{value}</span></div>)}</div><pre className="json">{JSON.stringify(solution.parameters,null,2)}</pre></section>}
       </>}
     </main><footer>Optimization Lab · AI model · validate · recommend · solve</footer>
   </div>

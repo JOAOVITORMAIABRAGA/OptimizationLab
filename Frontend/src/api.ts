@@ -13,18 +13,25 @@ export type ProblemForm = {
   variables: Variable[]
   objective_kind: string
   objective_sense: string
+  objective_metric?: string | null
+  objective_status?: string | null
   expression: string
   representation: string
+  problem_structure?: string | null
+  problem_structure_metadata?: Record<string, unknown>
+  representation_metadata?: Record<string, unknown>
 }
 
 export type AIProblem = Omit<ProblemForm, 'representation'> & {
   representation: string | null
+  objective?: { kind?: string; sense?: string; status?: string; metric?: string | null; expression?: unknown }
 }
 
 export type Analysis = {
   problem: Record<string, unknown>
   validation: { valid: boolean; blocking: boolean; errors: string[]; warnings: string[] }
-  compatibility: { algorithm_id: string; algorithm_name: string; status: string; reasons: string[]; warnings: string[]; required_adapters: string[]; required_operators: string[] }[]
+  compatibility: { algorithm_id: string; algorithm_name: string; status: string; reasons: string[]; warnings: string[]; required_adapters: string[]; required_operators: string[]; target_representation?: string | null }[]
+  candidates: { algorithm_id: string; algorithm_name: string; compatibility: string; compatibility_score: number; recommendation_score: number; adaptation: string[]; estimated_cost: string; algorithm_type: string; reasons: string[]; warnings: string[]; recommended: boolean }[]
   recommendations: { algorithm_id: string; algorithm_name: string; score: number; rank: number; rationale: string; strengths: string[]; weaknesses: string[]; evidence: string[] }[]
   excluded_algorithms: { algorithm_id: string; reason: string; compatibility_status: string | null; evidence: string[] }[]
 }
@@ -67,8 +74,8 @@ export async function metadata() {
 
 export type SolveResult = {
   algorithm_id: string
-  solution: number[]
-  variable_values: Record<string, number>
+  solution: unknown[]
+  variable_values: Record<string, unknown>
   objective_value: number
   parameters: Record<string, unknown>
 }

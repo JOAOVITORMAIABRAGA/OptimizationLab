@@ -64,3 +64,21 @@ export async function metadata() {
   if (!response.ok) throw new Error('Could not load backend metadata.')
   return response.json()
 }
+
+export type SolveResult = {
+  algorithm_id: string
+  solution: number[]
+  variable_values: Record<string, number>
+  objective_value: number
+  parameters: Record<string, unknown>
+}
+
+export async function solve(problem: ProblemForm, algorithm_id: string): Promise<SolveResult> {
+  const response = await fetch(`${API_URL}/api/solve`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...problem, algorithm_id })
+  })
+  if (!response.ok) throw new Error(await parseError(response, 'Could not solve the problem.'))
+  return response.json()
+}

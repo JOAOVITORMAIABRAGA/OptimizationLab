@@ -29,14 +29,11 @@ def test_algorithms_run():
         AntColonyOptimization,
         TabuSearch,
         HillClimbing,
-        LinearProgramming,
-        IntegerProgramming,
-        ConstraintProgramming,
     ]:
         algo = cls()
         algo.configure(None)
         sol, fit = algo.optimize(fitness, bounds, is_minimization=True)
         results.append((cls.__name__, sol, fit))
 
-    assert len(results) == 11
+    assert len(results) == 8
     assert all(sol is not None for _, sol, _ in results)

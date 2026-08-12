@@ -158,11 +158,11 @@ def test_registry_validates_structure_and_availability():
     assert registry.validate_descriptor(descriptor_unavailable)
 
 
-def test_classical_algorithms_are_marked_unavailable():
+def test_classical_algorithms_are_available_when_real_backends_exist():
     registry = AlgorithmRegistry.from_builtin_algorithms()
-    assert registry.get("linear_programming").availability == AlgorithmAvailability.UNAVAILABLE
-    assert registry.get("integer_programming").availability == AlgorithmAvailability.UNAVAILABLE
-    assert registry.get("constraint_programming").availability == AlgorithmAvailability.UNAVAILABLE
+    assert registry.get("linear_programming").availability == AlgorithmAvailability.AVAILABLE
+    assert registry.get("integer_programming").availability == AlgorithmAvailability.AVAILABLE
+    assert registry.get("constraint_programming").availability == AlgorithmAvailability.AVAILABLE
 
 
 def test_registry_can_list_all_algorithms():

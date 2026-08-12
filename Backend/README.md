@@ -31,6 +31,13 @@ Future Optimization Engine
 
 The LLM is a modeling component, not an execution environment.
 
+For tabular datasets, the modeling pipeline can recognize a decision
+indexed by a dataset entity (for example, production quantity per product),
+map numeric columns to objective coefficients/bounds, and expand the indexed
+concept into the scalar declarative variables required by the current
+`OptimizationProblem` contract. The numerical values always come from the
+dataset; the system never fabricates missing parameters.
+
 ## Responsibilities
 
 The backend currently handles:

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { AlertTriangle, ArrowRight, Check, FileText, Settings2, Sparkles, Upload, X } from 'lucide-react'
-import { analyze, metadata, modelProblem, type AIModel, type Analysis, type ProblemForm, type Variable } from './api'
+import { analyze, metadata, modelProblem, solve, type AIModel, type Analysis, type ProblemForm, type SolveResult, type Variable } from './api'
 
 const fallback = { problem_families: ['continuous_optimization','routing','scheduling','assignment','feature_selection','generic'], mathematical_properties: ['continuous','discrete','binary','constrained','unconstrained','linear','nonlinear','integer','mixed_integer','black_box','multiobjective'], variable_types: ['continuous','integer','binary','categorical','discrete'], representations: ['vector','permutation','graph','set','sequence','mixed','matrix'], objective_kinds: ['single','multi'], objective_senses: ['minimize','maximize'] }
 const emptyForm: ProblemForm = { name: '', description: '', problem_family: 'generic', mathematical_properties: [], variables: [{name:'x1',variable_type:'continuous',lower_bound:null,upper_bound:null}], objective_kind:'single', objective_sense:'minimize', expression:'x1', representation:'vector' }
@@ -17,6 +17,7 @@ function App() {
   const [result, setResult] = useState<Analysis | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [solution, setSolution] = useState<SolveResult | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { metadata().then(setMeta).catch(() => {}) }, [])
@@ -27,16 +28,49 @@ function App() {
   const runAI = async () => {
     if (!description.trim()) return setError('Describe the optimization problem first.')
     if (!file) return setError('Upload a CSV dataset first.')
-    setLoading(true); setError(''); setAiModel(null); setResult(null)
+    setLoading(true); setError(''); setAiModel(null); setResult(null); setSolution(null)
     try { setAiModel(await modelProblem(description, file)) } catch(e) { setError(e instanceof Error?e.message:'AI modeling failed.') } finally { setLoading(false) }
   }
 
-  const validate = async () => {
-    setLoading(true); setError('')
-    try { setResult(await analyze(form)) } catch(e) { setError(e instanceof Error?e.message:'Request failed.') } finally { setLoading(false) }
+  const validateProblem = async (problem: ProblemForm) => {
+    setLoading(true); setError(''); setSolution(null)
+    try {
+      const normalized = { ...problem, representation: problem.representation || 'vector' }
+      const analysis = await analyze(normalized)
+      setForm(normalized)
+      setResult(analysis)
+      return analysis
+    } catch(e) {
+      setError(e instanceof Error?e.message:'Request failed.')
+      return null
+    } finally { setLoading(false) }
   }
 
-  const acceptAI = () => { if (!aiModel) return; setForm({...aiModel.problem, representation: aiModel.problem.representation ?? ''}); setMode('advanced'); setAiModel(null) }
+  const validate = async () => validateProblem(form)
+
+  const acceptAI = async () => {
+    if (!aiModel || aiModel.incomplete) return
+    const nextForm: ProblemForm = {
+      ...aiModel.problem,
+      representation: aiModel.problem.representation || 'vector',
+    }
+    setForm(nextForm)
+    setAiModel(null)
+    setMode('ai')
+    await validateProblem(nextForm)
+  }
+
+  const solveRecommended = async () => {
+    if (!result?.validation.valid || result.recommendations.length === 0) return
+    const algorithm = result.recommendations[0].algorithm_id
+    setLoading(true); setError('')
+    try {
+      setSolution(await solve(form, algorithm))
+    } catch(e) {
+      setError(e instanceof Error?e.message:'Could not solve the problem.')
+    } finally { setLoading(false) }
+  }
+
   const toggle = (p:string) => setForm(f=>({...f,mathematical_properties:f.mathematical_properties.includes(p)?f.mathematical_properties.filter(x=>x!==p):[...f.mathematical_properties,p]}))
   const selectFile = (f: File | undefined) => { if (!f) return; if (!f.name.toLowerCase().endsWith('.csv')) return setError('Only CSV files are supported in this MVP.'); setFile(f); setError('') }
 
@@ -63,7 +97,7 @@ function App() {
         <div className="info"><span>Mathematical properties</span><div className="chips readonly">{aiModel.problem.mathematical_properties.map(p=><span className="chip active" key={p}>{p}</span>)}</div></div>
         <div className="dataset-card"><div><FileText size={17}/><strong>{aiModel.dataset.filename}</strong><span>{aiModel.dataset.row_count.toLocaleString()} rows · {aiModel.dataset.column_count} columns</span></div><small>{aiModel.dataset.columns.join(' · ')}</small></div>
         {aiModel.assumptions.length>0 && <div className="assumptions"><AlertTriangle size={16}/><div><strong>AI assumptions / uncertainties</strong>{aiModel.assumptions.map(a=><div key={a}>• {a}</div>)}</div></div>}
-        <div className="actions"><button className="ghost" onClick={()=>{setForm({...aiModel.problem, representation: aiModel.problem.representation ?? ''});setAiModel(null);setMode('advanced')}}><Settings2 size={16}/> Edit model</button><button className="primary compact" disabled={aiModel.incomplete} onClick={()=>{setForm({...aiModel.problem, representation: aiModel.problem.representation ?? ''});setAiModel(null);setMode('advanced');setTimeout(validate,0)}}>{aiModel.incomplete ? 'Edit model to continue' : 'Accept & validate'} {!aiModel.incomplete && <ArrowRight size={17}/>}</button></div>
+        <div className="actions"><button className="ghost" onClick={()=>{setForm({...aiModel.problem, representation: aiModel.problem.representation || 'vector'});setAiModel(null);setMode('advanced')}}><Settings2 size={16}/> Edit model</button><button className="primary compact" disabled={aiModel.incomplete || loading} onClick={acceptAI}>{aiModel.incomplete ? 'Edit model to continue' : loading ? 'Validating…' : 'Accept & validate'} {!aiModel.incomplete && !loading && <ArrowRight size={17}/>}</button></div>
       </section>}
 
       {mode==='advanced' && <section className="card configuration">
@@ -83,8 +117,10 @@ function App() {
         <section className="card"><div className="section-head"><span className="step">04</span><div><h2>Structured problem</h2><p>What the user/AI proposed → how the domain understood it.</p></div></div><pre className="json">{JSON.stringify(result.problem,null,2)}</pre></section>
         <section className="card"><div className="section-head"><span className="step">05</span><div><h2>Compatibility</h2><p>{compatibleCount} algorithm{compatibleCount===1?'':'s'} can work with this problem according to CompatibilityEngine.</p></div></div><div className="algorithm-grid">{result.compatibility.map(a=><article className={`algorithm ${a.status==='incompatible'?'bad':''}`} key={a.algorithm_id}><div className="algo-top"><strong>{a.algorithm_name}</strong>{a.status==='incompatible'?<X/>:<Check/>}</div><span className="badge">{a.status.replaceAll('_',' ')}</span>{a.reasons.length>0&&<ul>{a.reasons.slice(0,3).map(r=><li key={r}>{r}</li>)}</ul>}</article>)}</div></section>
         <section className="card recommendations"><div className="section-head"><span className="step">06</span><div><h2>Recommendations</h2><p><Sparkles size={15}/> RecommendationEngine scoring — not empirical benchmark results.</p></div></div>{result.recommendations.length===0?<div className="empty">No compatible algorithms were recommended.</div>:result.recommendations.map(r=><article className="recommendation" key={r.algorithm_id}><div className="rank">#{r.rank}</div><div className="rec-body"><div className="rec-title"><strong>{r.algorithm_name}</strong><b>{r.score.toFixed(2)}</b></div><p>{r.rationale}</p><div className="evidence">{r.evidence.map(x=><span key={x}>{x}</span>)}</div></div></article>)}</section>
+        {result.validation.valid && result.recommendations.length > 0 && !solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Execute the top structurally recommended compatible algorithm.</p></div></div><div className="result success"><Check/><div><strong>{result.recommendations[0].algorithm_name}</strong><div className="message">The model is valid and an executable compatible solver is available.</div></div></div><button className="primary" onClick={solveRecommended} disabled={loading}>{loading?'Solving…':'Solve problem'}<ArrowRight size={18}/></button></section>}
+        {solution && <section className="card solve-card"><div className="section-head"><span className="step">07</span><div><h2>Solution</h2><p>Returned by the selected executable solver.</p></div></div><div className="result success"><Check/><div><strong>Optimal solution found</strong><div className="message">Algorithm: {solution.algorithm_id}</div><div className="message">Objective value: {solution.objective_value}</div></div></div><div className="variable-list">{Object.entries(solution.variable_values).map(([name,value])=><div className="variable" key={name}><strong>{name}</strong><span>{value}</span></div>)}</div><pre className="json">{JSON.stringify(solution.parameters,null,2)}</pre></section>}
       </>}
-    </main><footer>Optimization Lab · AI-first MVP · Steps 1–5 only · No execution / benchmark yet</footer>
+    </main><footer>Optimization Lab · AI model · validate · recommend · solve</footer>
   </div>
 }
 export default App

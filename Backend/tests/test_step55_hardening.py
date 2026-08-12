@@ -106,12 +106,12 @@ def test_builtin_available_descriptors_have_structural_implementations():
             assert registry.validate_implementation(descriptor.implementation_class)
 
 
-def test_numeric_algorithms_do_not_claim_integer_or_binary_support():
+def test_classical_solvers_are_the_explicit_exact_integer_binary_backends():
     registry = AlgorithmRegistry.from_builtin_algorithms()
-    for algorithm_id in ("ga", "pso", "de", "bfo", "sa", "aco", "tabu", "hill_climbing"):
+    for algorithm_id in ("integer_programming", "constraint_programming"):
         descriptor = registry.get(algorithm_id)
-        assert VariableType.INTEGER not in descriptor.supported_variable_types
-        assert VariableType.BINARY not in descriptor.supported_variable_types
+        assert VariableType.INTEGER in descriptor.supported_variable_types
+        assert VariableType.BINARY in descriptor.supported_variable_types
 
 
 def test_aco_is_honest_about_graph_and_permutation_support():

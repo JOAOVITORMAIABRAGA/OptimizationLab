@@ -14,12 +14,14 @@ from pydantic import BaseModel, Field, field_validator
 from algorithms.registry import AlgorithmRegistry
 from compatibility.compatibility_engine import CompatibilityEngine, CompatibilityStatus
 from domain.expressions import StructuredExpression
-from domain.objectives import ObjectiveKind, ObjectiveSense
+from domain.objectives import ObjectiveKind, ObjectiveMetric, ObjectiveSense, ObjectiveStatus
 from domain.problem import ConstraintSpec, DomainSpec, ObjectiveSpec, OptimizationProblem, SolutionRepresentationSpec, VariableSpec
+from domain.structures import ProblemStructureKind, ProblemStructureSpec
 from domain.problem_family import MathematicalProperty, ProblemFamily
 from domain.representations import SolutionRepresentationKind
 from domain.variables import VariableType
 from recommendation.recommendation_engine import RecommendationEngine
+from adapters.problem_adapters import BUILTIN_ADAPTERS
 from validation.validator import ValidationEngine
 from services.llm_service import GroqLLMService
 from services.execution_engine import OptimizationExecutionEngine
@@ -37,10 +39,12 @@ class ConstraintInput(BaseModel):
     name: str = Field(min_length=1)
     kind: str = "hard"
     relation: str
+    scope: str = "algebraic"
     expression: Optional[str] = None
     lower_bound: Optional[float] = None
     upper_bound: Optional[float] = None
     threshold: Optional[float] = None
+    bound: Optional[float] = None
 
 
 class ObjectiveInput(BaseModel):
@@ -65,10 +69,15 @@ class ProblemInput(BaseModel):
     variables: List[VariableInput] = Field(min_length=1)
     objective_kind: ObjectiveKind = ObjectiveKind.SINGLE
     objective_sense: ObjectiveSense = ObjectiveSense.MINIMIZE
+    objective_metric: Optional[ObjectiveMetric] = None
+    objective_status: Optional[ObjectiveStatus] = None
     expression: str = ""
     objectives: List[ObjectiveInput] = Field(default_factory=list)
     constraints: List[ConstraintInput] = Field(default_factory=list)
     representation: SolutionRepresentationKind = SolutionRepresentationKind.VECTOR
+    representation_metadata: Dict[str, Any] = Field(default_factory=dict)
+    problem_structure: Optional[ProblemStructureKind] = None
+    problem_structure_metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AIDraftProblem(BaseModel):
@@ -80,8 +89,14 @@ class AIDraftProblem(BaseModel):
     variables: List[VariableInput] = Field(default_factory=list)
     objective_kind: ObjectiveKind = ObjectiveKind.SINGLE
     objective_sense: ObjectiveSense = ObjectiveSense.MINIMIZE
+    objective_metric: Optional[ObjectiveMetric] = None
+    objective_status: Optional[ObjectiveStatus] = None
     expression: str = ""
+    constraints: List[ConstraintInput] = Field(default_factory=list)
     representation: Optional[SolutionRepresentationKind] = None
+    representation_metadata: Dict[str, Any] = Field(default_factory=dict)
+    problem_structure: Optional[ProblemStructureKind] = None
+    problem_structure_metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AIModelResponse(BaseModel):
@@ -107,6 +122,21 @@ class CompatibilityResponse(BaseModel):
     warnings: List[str]
     required_adapters: List[str]
     required_operators: List[str]
+    target_representation: Optional[str] = None
+
+
+class AlgorithmCandidateResponse(BaseModel):
+    algorithm_id: str
+    algorithm_name: str
+    compatibility: str
+    compatibility_score: float
+    recommendation_score: float
+    adaptation: List[str]
+    estimated_cost: str
+    algorithm_type: str
+    reasons: List[str]
+    warnings: List[str]
+    recommended: bool
 
 
 class RecommendationResponse(BaseModel):
@@ -124,6 +154,7 @@ class AnalysisResponse(BaseModel):
     problem: Dict[str, Any]
     validation: ValidationResponse
     compatibility: List[CompatibilityResponse]
+    candidates: List[AlgorithmCandidateResponse]
     recommendations: List[RecommendationResponse]
     excluded_algorithms: List[Dict[str, Any]]
 
@@ -182,12 +213,31 @@ def expression_to_dict(expression: StructuredExpression) -> Dict[str, Any]:
     return data
 
 
+def _is_native_graph_problem(payload: ProblemInput) -> bool:
+    return (
+        payload.problem_structure == ProblemStructureKind.GRAPH
+        or payload.representation in {
+            SolutionRepresentationKind.GRAPH,
+            SolutionRepresentationKind.EDGE_WALK,
+            SolutionRepresentationKind.EDGE_SET,
+        }
+    )
+
+
 def build_problem(payload: ProblemInput) -> OptimizationProblem:
     variable_names = {item.name for item in payload.variables}
     if len(variable_names) != len(payload.variables):
         raise ValueError("Variable names must be unique.")
 
-    expression = ExpressionParser().parse(payload.expression, variable_names) if payload.expression else None
+    native_graph = _is_native_graph_problem(payload)
+    # Native graph solvers consume graph structure + semantic metrics.
+    # Their routes/edges are not algebraic variables, so never send graph
+    # expressions through the generic expression parser.
+    expression = (
+        None
+        if native_graph
+        else (ExpressionParser().parse(payload.expression, variable_names) if payload.expression else None)
+    )
     variables: List[VariableSpec] = []
     for item in payload.variables:
         if item.variable_type == VariableType.BINARY:
@@ -197,7 +247,11 @@ def build_problem(payload: ProblemInput) -> OptimizationProblem:
         elif item.variable_type == VariableType.CONTINUOUS:
             domain = DomainSpec(kind="continuous", lower=item.lower_bound, upper=item.upper_bound)
         elif item.variable_type == VariableType.DISCRETE:
-            domain = DomainSpec(kind="discrete", lower=item.lower_bound, upper=item.upper_bound)
+            if payload.representation == SolutionRepresentationKind.GRAPH:
+                edge_ids = [edge.get("id") for edge in payload.representation_metadata.get("edges", []) if isinstance(edge, dict) and edge.get("id") is not None]
+                domain = DomainSpec(kind="graph", elements=edge_ids or None)
+            else:
+                domain = DomainSpec(kind="discrete", lower=item.lower_bound, upper=item.upper_bound)
         else:
             domain = DomainSpec(kind="categorical")
         variables.append(VariableSpec(name=item.name, variable_type=item.variable_type, domain=domain, lower_bound=item.lower_bound, upper_bound=item.upper_bound))
@@ -212,23 +266,34 @@ def build_problem(payload: ProblemInput) -> OptimizationProblem:
         )
         objective = ObjectiveSpec(kind=ObjectiveKind.MULTI, sense=None, expression=None, objectives=objectives)
     else:
-        if expression is None:
-            raise ValueError("A single objective expression is required.")
-        objective = ObjectiveSpec(kind=payload.objective_kind, sense=payload.objective_sense, expression=expression)
+        if expression is None and payload.objective_metric is None:
+            raise ValueError("A single objective requires an explicit expression or a semantic objective metric.")
+        objective = ObjectiveSpec(
+            kind=payload.objective_kind,
+            sense=payload.objective_sense,
+            expression=expression,
+            metric=payload.objective_metric,
+        )
 
     constraints = []
     for item in payload.constraints:
-        constraint_expression = ExpressionParser().parse(item.expression, variable_names) if item.expression else None
+        constraint_expression = (
+            None
+            if native_graph
+            else (ExpressionParser().parse(item.expression, variable_names) if item.expression else None)
+        )
         constraints.append(
             ConstraintSpec(
                 id=item.id,
                 name=item.name,
                 kind=item.kind,
                 relation=item.relation,
+                scope=("structural" if native_graph else item.scope),
                 expression=constraint_expression,
                 lower_bound=item.lower_bound,
                 upper_bound=item.upper_bound,
-                threshold=item.threshold,
+                threshold=item.threshold if item.threshold is not None else item.bound,
+                bound=item.bound,
             )
         )
 
@@ -240,7 +305,16 @@ def build_problem(payload: ProblemInput) -> OptimizationProblem:
         variables=variables,
         constraints=constraints,
         objective=objective,
-        solution_representation=SolutionRepresentationSpec(kind=payload.representation, name=payload.representation.value),
+        problem_structure=(
+            ProblemStructureSpec(
+                kind=payload.problem_structure or (ProblemStructureKind.GRAPH if payload.representation == SolutionRepresentationKind.GRAPH else ProblemStructureKind.TABULAR),
+                name=(payload.problem_structure or (ProblemStructureKind.GRAPH if payload.representation == SolutionRepresentationKind.GRAPH else ProblemStructureKind.TABULAR)).value,
+                metadata=payload.problem_structure_metadata or (payload.representation_metadata if payload.representation == SolutionRepresentationKind.GRAPH else {}),
+            )
+            if payload.problem_structure or payload.representation == SolutionRepresentationKind.GRAPH
+            else None
+        ),
+        solution_representation=SolutionRepresentationSpec(kind=payload.representation, name=payload.representation.value, metadata=payload.representation_metadata),
     )
 
 
@@ -263,11 +337,29 @@ def problem_to_dict(problem: OptimizationProblem) -> Dict[str, Any]:
             }
             for variable in problem.variables
         ],
+        "constraints": [
+            {
+                "id": constraint.id,
+                "name": constraint.name,
+                "kind": constraint.kind,
+                "scope": constraint.scope,
+                "relation": constraint.relation,
+                "expression": expression_to_dict(constraint.expression) if constraint.expression else None,
+                "lower_bound": constraint.lower_bound,
+                "upper_bound": constraint.upper_bound,
+                "threshold": constraint.threshold,
+            }
+            for constraint in problem.constraints
+        ],
         "objective": {
             "kind": problem.objective.kind.value if hasattr(problem.objective.kind, "value") else problem.objective.kind,
             "sense": problem.objective.sense.value if hasattr(problem.objective.sense, "value") else problem.objective.sense,
+            "status": problem.objective.status.value if hasattr(problem.objective.status, "value") else problem.objective.status,
+            "metric": problem.objective.metric.value if hasattr(problem.objective.metric, "value") else problem.objective.metric,
             "expression": expression_to_dict(problem.objective.expression) if problem.objective.expression else None,
         },
+        "problem_structure": problem.problem_structure.kind.value if problem.problem_structure else None,
+        "problem_structure_metadata": problem.problem_structure.metadata if problem.problem_structure else {},
         "solution_representation": problem.solution_representation.kind.value if problem.solution_representation else None,
     }
 
@@ -295,6 +387,8 @@ def metadata() -> Dict[str, Any]:
         "representations": [item.value for item in SolutionRepresentationKind],
         "objective_kinds": [item.value for item in ObjectiveKind],
         "objective_senses": [item.value for item in ObjectiveSense],
+        "objective_metrics": [item.value for item in ObjectiveMetric],
+        "objective_statuses": [item.value for item in ObjectiveStatus],
     }
 
 
@@ -352,8 +446,14 @@ def validate_ai_draft(draft: Dict[str, Any]) -> AIDraftProblem:
         "variables",
         "objective_kind",
         "objective_sense",
+        "objective_metric",
+        "objective_status",
         "expression",
+        "constraints",
         "representation",
+        "representation_metadata",
+        "problem_structure",
+        "problem_structure_metadata",
     }
 
     candidate = {
@@ -361,6 +461,10 @@ def validate_ai_draft(draft: Dict[str, Any]) -> AIDraftProblem:
         for key, value in draft.items()
         if key in allowed
     }
+
+    candidate.setdefault("constraints", [])
+    candidate.setdefault("representation_metadata", {})
+    candidate.setdefault("problem_structure_metadata", {})
 
     # In an incomplete AI draft, representation may legitimately be
     # undefined. LLMs sometimes return "" instead of null.
@@ -372,6 +476,20 @@ def validate_ai_draft(draft: Dict[str, Any]) -> AIDraftProblem:
         candidate["expression"] = ""
 
     return AIDraftProblem.model_validate(candidate)
+
+
+
+def _model_problem_view(problem_payload: AIDraftProblem) -> Dict[str, Any]:
+    """Expose both the flat legacy contract and the canonical objective view."""
+    data = problem_payload.model_dump(mode="json")
+    data["objective"] = {
+        "kind": data.get("objective_kind"),
+        "sense": data.get("objective_sense"),
+        "status": data.get("objective_status"),
+        "metric": data.get("objective_metric"),
+        "expression": data.get("expression") or None,
+    }
+    return data
 
 
 @app.post("/api/model", response_model=AIModelResponse)
@@ -388,14 +506,17 @@ async def model_problem(description: str = Form(...), file: UploadFile = File(..
             "mathematical_properties": [item.value for item in MathematicalProperty],
             "variable_types": [item.value for item in VariableType],
             "representations": [item.value for item in SolutionRepresentationKind],
+            "problem_structures": [item.value for item in ProblemStructureKind],
             "objective_kinds": [item.value for item in ObjectiveKind],
             "objective_senses": [item.value for item in ObjectiveSense],
+        "objective_metrics": [item.value for item in ObjectiveMetric],
+        "objective_statuses": [item.value for item in ObjectiveStatus],
         }
         draft = GroqLLMService().draft_model(description.strip(), dataset)
         problem_payload = validate_ai_draft(draft)
         incomplete = (
             not problem_payload.variables
-            or not problem_payload.expression.strip()
+            or problem_payload.objective_status == ObjectiveStatus.INCOMPLETE
         )
 
         # A draft with no defensible decision variables is intentionally an
@@ -415,7 +536,7 @@ async def model_problem(description: str = Form(...), file: UploadFile = File(..
         raise HTTPException(status_code=502, detail=f"AI modeling failed: {exc}") from exc
 
     return AIModelResponse(
-        problem=problem_payload.model_dump(mode="json"),
+        problem=_model_problem_view(problem_payload),
         explanation=str(draft.get("explanation", "The AI proposed this model based on your description and dataset.")),
         assumptions=[str(item) for item in draft.get("assumptions", [])],
         dataset={key: value for key, value in dataset.items() if key != "allowed_values"},
@@ -431,13 +552,23 @@ def analyze(payload: ProblemInput) -> AnalysisResponse:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     report = validation_engine.validate(problem)
-    validation = ValidationResponse(valid=report.is_valid(), blocking=bool(report.errors), errors=report.errors, warnings=report.warnings)
-    if not report.is_valid():
-        return AnalysisResponse(problem=problem_to_dict(problem), validation=validation, compatibility=[], recommendations=[], excluded_algorithms=[])
+    validation = ValidationResponse(
+        valid=report.is_valid(),
+        blocking=bool(report.errors),
+        errors=report.errors,
+        warnings=report.warnings,
+    )
 
+    # Keep compatibility diagnostic even when validation is blocking. An empty
+    # compatibility array used to make every validation issue look like
+    # "0 compatible algorithms", hiding the actual failing contract.
     compatibility_results: List[CompatibilityResponse] = []
     for descriptor in sorted(registry.get_all(), key=lambda item: item.id):
-        result = compatibility_engine.check(problem, descriptor)
+        result = compatibility_engine.check(
+            problem,
+            descriptor,
+            available_adapters=set(BUILTIN_ADAPTERS),
+        )
         compatibility_results.append(CompatibilityResponse(
             algorithm_id=descriptor.id,
             algorithm_name=descriptor.name,
@@ -446,9 +577,38 @@ def analyze(payload: ProblemInput) -> AnalysisResponse:
             warnings=list(result.warnings),
             required_adapters=list(result.required_adapters),
             required_operators=list(result.required_operators),
+            target_representation=(result.adaptation_plan.target_representation.value if result.adaptation_plan else None),
         ))
 
-    recommendations_result = recommendation_engine.recommend(problem, registry, compatibility_engine=compatibility_engine)
+    # A blocking validation report must never be bypassed for recommendation
+    # or execution. Compatibility remains visible purely as diagnostics.
+    recommendations_result = (
+        recommendation_engine.recommend(
+            problem,
+            registry,
+            compatibility_engine=compatibility_engine,
+            available_adapters=set(BUILTIN_ADAPTERS),
+        )
+        if report.is_valid()
+        else None
+    )
+
+    candidate_items = recommendations_result.candidates if recommendations_result else []
+    candidates = [AlgorithmCandidateResponse(
+        algorithm_id=item.algorithm_id,
+        algorithm_name=item.algorithm_name,
+        compatibility=item.compatibility.value,
+        compatibility_score=item.compatibility_score,
+        recommendation_score=item.recommendation_score,
+        adaptation=list(item.adaptation),
+        estimated_cost=item.estimated_cost,
+        algorithm_type=item.algorithm_type,
+        reasons=list(item.reasons),
+        warnings=list(item.warnings),
+        recommended=item.recommended,
+    ) for item in candidate_items]
+
+    recommendation_items = recommendations_result.recommendations if recommendations_result else []
     recommendations = [RecommendationResponse(
         algorithm_id=item.algorithm_id,
         algorithm_name=item.algorithm_name,
@@ -458,10 +618,24 @@ def analyze(payload: ProblemInput) -> AnalysisResponse:
         strengths=list(item.strengths),
         weaknesses=list(item.weaknesses),
         evidence=list(item.evidence),
-    ) for item in recommendations_result.recommendations]
-    excluded = [{"algorithm_id": item.algorithm_id, "reason": item.reason, "compatibility_status": item.compatibility_status.value if item.compatibility_status else None, "evidence": list(item.evidence)} for item in recommendations_result.excluded_algorithms]
+    ) for item in recommendation_items]
 
-    return AnalysisResponse(problem=problem_to_dict(problem), validation=validation, compatibility=compatibility_results, recommendations=recommendations, excluded_algorithms=excluded)
+    excluded_items = recommendations_result.excluded_algorithms if recommendations_result else []
+    excluded = [{
+        "algorithm_id": item.algorithm_id,
+        "reason": item.reason,
+        "compatibility_status": item.compatibility_status.value if item.compatibility_status else None,
+        "evidence": list(item.evidence),
+    } for item in excluded_items]
+
+    return AnalysisResponse(
+        problem=problem_to_dict(problem),
+        validation=validation,
+        compatibility=compatibility_results,
+        candidates=candidates,
+        recommendations=recommendations,
+        excluded_algorithms=excluded,
+    )
 
 
 class SolveProblemRequest(ProblemInput):
@@ -470,13 +644,31 @@ class SolveProblemRequest(ProblemInput):
 
 class SolveProblemResponse(BaseModel):
     algorithm_id: str
-    solution: List[float]
-    variable_values: Dict[str, float]
+    solution: List[Any]
+    variable_values: Dict[str, Any]
     objective_value: float
     parameters: Dict[str, Any]
 
 
 execution_engine = OptimizationExecutionEngine(registry)
+
+
+@app.post("/api/solve-auto", response_model=SolveProblemResponse)
+def solve_auto(payload: ProblemInput) -> SolveProblemResponse:
+    """Select the fastest structurally suitable registered solver, then execute it."""
+    try:
+        problem = build_problem(payload)
+        result = execution_engine.execute_auto(problem)
+    except (ValueError, KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    variable_values = {name: float(value) if isinstance(value, (int, float)) else value for name, value in result.variable_values.items()}
+    return SolveProblemResponse(
+        algorithm_id=result.algorithm_id,
+        solution=result.solution,
+        variable_values=variable_values,
+        objective_value=result.objective_value,
+        parameters=result.parameters,
+    )
 
 
 @app.post("/api/solve", response_model=SolveProblemResponse)
@@ -486,10 +678,7 @@ def solve(payload: SolveProblemRequest) -> SolveProblemResponse:
         result = execution_engine.execute(problem, payload.algorithm_id)
     except (ValueError, KeyError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    variable_values = {
-        variable.name: float(value)
-        for variable, value in zip(problem.variables, result.solution)
-    }
+    variable_values = {name: float(value) if isinstance(value, (int, float)) else value for name, value in result.variable_values.items()}
     return SolveProblemResponse(
         algorithm_id=result.algorithm_id,
         solution=result.solution,

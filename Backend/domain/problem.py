@@ -8,6 +8,7 @@ from .expressions import StructuredExpression
 from .objectives import ObjectiveKind, ObjectiveSense, ObjectiveSpec
 from .problem_family import MathematicalProperty, ProblemFamily
 from .representations import SolutionRepresentationKind
+from .structures import ProblemStructureSpec
 from .variables import VariableType
 
 
@@ -44,8 +45,10 @@ class ConstraintSpec:
     lower_bound: Optional[float] = None
     upper_bound: Optional[float] = None
     threshold: Optional[float] = None
+    bound: Optional[float] = None
     weight: Optional[float] = None
     description: Optional[str] = None
+    scope: str = "algebraic"
 
 
 @dataclass
@@ -72,6 +75,9 @@ class OptimizationProblem:
     constraints: List[ConstraintSpec] = field(default_factory=list)
     problem_family: ProblemFamily = ProblemFamily.GENERIC
     mathematical_properties: Set[MathematicalProperty] = field(default_factory=set)
+    # Structure describes the optimization instance; representation describes the candidate solution.
+    # Keep solution_representation as the existing public contract for backward compatibility.
+    problem_structure: Optional[ProblemStructureSpec] = None
     solution_representation: Optional[SolutionRepresentationSpec] = None
     dataset: Optional[DatasetSpec] = None
     description: Optional[str] = None

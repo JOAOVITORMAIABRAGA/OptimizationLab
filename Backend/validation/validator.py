@@ -5,9 +5,10 @@ from typing import List, Optional, Set, Tuple
 
 from domain.expressions import StructuredExpression
 from domain.problem import ConstraintSpec, DomainSpec, OptimizationProblem, ObjectiveSpec, VariableSpec
-from domain.objectives import ObjectiveKind
+from domain.objectives import ObjectiveKind, ObjectiveMetric, ObjectiveStatus
 from domain.problem_family import MathematicalProperty, ProblemFamily
 from domain.representations import SolutionRepresentationKind
+from domain.structures import ProblemStructureKind
 from domain.variables import VariableType
 
 
@@ -43,8 +44,9 @@ class ValidationEngine:
             for variable in problem.variables:
                 self._validate_variable(variable, report)
 
+        native_graph = self._is_native_graph(problem)
         for constraint in problem.constraints:
-            self._validate_constraint(constraint, problem.variables, report)
+            self._validate_constraint(constraint, problem.variables, report, native_graph=native_graph)
 
         self._validate_problem_family(problem, report)
         self._validate_representation(problem, report)
@@ -65,10 +67,27 @@ class ValidationEngine:
             return
         if not objective.sense:
             report.errors.append("Objective sense is required.")
-        if objective.expression is None:
-            report.errors.append("Objective expression is required.")
-        else:
+
+        has_expression = objective.expression is not None
+        has_metric = objective.metric is not None
+        if objective.status == ObjectiveStatus.COMPLETE and not (has_expression or has_metric):
+            report.errors.append("Complete objective must define an expression or semantic metric.")
+        elif objective.status == ObjectiveStatus.INCOMPLETE and (has_expression or has_metric):
+            report.errors.append("Incomplete objective cannot contain a complete expression or semantic metric.")
+        elif objective.status == ObjectiveStatus.NOT_APPLICABLE and has_expression:
+            report.errors.append("Non-applicable objective cannot define an expression.")
+        elif not has_expression and not has_metric and objective.status != ObjectiveStatus.NOT_APPLICABLE:
+            report.errors.append("Objective requires either an explicit expression or a semantic metric.")
+        if objective.expression is not None:
             self._validate_expression(objective.expression, variables, report, context="objective")
+        if objective.metric is not None:
+            try:
+                ObjectiveMetric(objective.metric)
+            except ValueError:
+                # Custom metrics remain valid at the domain level; native solvers
+                # decide which semantic metrics they support.
+                if not isinstance(objective.metric, str) or not objective.metric.strip():
+                    report.errors.append("Objective metric must be a non-empty string.")
 
     def _validate_variable(self, variable: VariableSpec, report: ValidationReport) -> None:
         if not variable.name:
@@ -117,7 +136,19 @@ class ValidationEngine:
             if not domain.values and not domain.elements:
                 report.errors.append(f"Discrete domain for variable '{variable.name}' must define values or elements.")
 
-    def _validate_constraint(self, constraint: ConstraintSpec, variables: List[VariableSpec], report: ValidationReport) -> None:
+    def _is_native_graph(self, problem: OptimizationProblem) -> bool:
+        return (
+            problem.problem_structure is not None
+            and problem.problem_structure.kind == ProblemStructureKind.GRAPH
+            and problem.solution_representation is not None
+            and problem.solution_representation.kind in {
+                SolutionRepresentationKind.GRAPH,
+                SolutionRepresentationKind.EDGE_WALK,
+                SolutionRepresentationKind.EDGE_SET,
+            }
+        )
+
+    def _validate_constraint(self, constraint: ConstraintSpec, variables: List[VariableSpec], report: ValidationReport, native_graph: bool = False) -> None:
         if not constraint.id:
             report.errors.append("Each constraint must have an id.")
         if not constraint.name:
@@ -126,6 +157,13 @@ class ValidationEngine:
             report.errors.append(f"Constraint '{constraint.name}' has an invalid kind.")
         if constraint.relation not in {"eq", "le", "ge", "bound", "custom"}:
             report.errors.append(f"Constraint '{constraint.name}' has an invalid relation.")
+        if constraint.scope not in {"algebraic", "structural"}:
+            report.errors.append(f"Constraint '{constraint.name}' has an invalid scope.")
+
+        if native_graph or constraint.scope == "structural":
+            # Graph-native constraints are interpreted by the graph adapter/solver.
+            # They must not be forced into scalar expression semantics.
+            return
 
         if constraint.relation in {"eq", "le", "ge", "custom"}:
             if constraint.expression is None:
@@ -153,22 +191,48 @@ class ValidationEngine:
             for variable in problem.variables:
                 if variable.variable_type not in {VariableType.CONTINUOUS, VariableType.INTEGER, VariableType.BINARY}:
                     report.errors.append("Vector representation is only valid for continuous, integer or binary variables.")
-        elif problem.solution_representation.kind == SolutionRepresentationKind.GRAPH:
-            for variable in problem.variables:
-                if variable.variable_type != VariableType.DISCRETE:
-                    report.errors.append("Graph representation requires discrete variables.")
+        elif problem.solution_representation.kind in {SolutionRepresentationKind.GRAPH, SolutionRepresentationKind.EDGE_WALK, SolutionRepresentationKind.EDGE_SET}:
+            structure = problem.problem_structure
+            if structure is not None and structure.kind != ProblemStructureKind.GRAPH:
+                report.errors.append("Graph-native solution representations require a GRAPH problem structure.")
+            metadata = {}
+            if structure is not None and structure.kind == ProblemStructureKind.GRAPH:
+                metadata.update(structure.metadata or {})
+            metadata.update(problem.solution_representation.metadata or {})
+            edges = metadata.get("edges") or []
+            if not edges:
+                report.errors.append("Graph structure requires a non-empty 'edges' metadata list.")
+            else:
+                for index, edge in enumerate(edges):
+                    if not isinstance(edge, dict):
+                        report.errors.append(f"Graph edge {index} must be an object.")
+                        continue
+                    for field_name in ("id", "u", "v", "weight"):
+                        if field_name not in edge:
+                            report.errors.append(f"Graph edge {index} is missing '{field_name}'.")
+                graph_type = metadata.get("graph_problem_type", "generic")
+                if graph_type == "shortest_path" and (metadata.get("source") is None or metadata.get("target") is None):
+                    report.errors.append("Shortest path graphs require 'source' and 'target' metadata.")
+                if graph_type == "chinese_postman" and metadata.get("directed", False):
+                    report.errors.append("The current Chinese Postman implementation supports undirected graphs only.")
 
     def _validate_consistency(self, problem: OptimizationProblem, report: ValidationReport) -> None:
         variable_names = {variable.name for variable in problem.variables}
-        if problem.objective is not None and problem.objective.expression is not None:
+        native_graph = self._is_native_graph(problem)
+        if not native_graph and problem.objective is not None and problem.objective.expression is not None:
             self._validate_expression_references(problem.objective.expression, variable_names, report, context="objective")
-        for constraint in problem.constraints:
-            if constraint.expression is not None:
-                self._validate_expression_references(constraint.expression, variable_names, report, context=f"constraint:{constraint.name}")
+        if not native_graph:
+            for constraint in problem.constraints:
+                if constraint.expression is not None:
+                    self._validate_expression_references(constraint.expression, variable_names, report, context=f"constraint:{constraint.name}")
 
-        if problem.problem_family == ProblemFamily.ROUTING:
-            if problem.solution_representation is None or problem.solution_representation.kind != SolutionRepresentationKind.PERMUTATION:
-                report.errors.append("Routing problems require a permutation-based representation.")
+        # A problem family describes semantics, not the solver encoding.
+        # Routing instances may remain graph-structured and be adapted to a
+        # permutation only when a selected algorithm requires it.
+
+        if problem.problem_structure is not None and problem.problem_structure.kind == ProblemStructureKind.GRAPH:
+            if problem.solution_representation is None:
+                report.errors.append("Graph problems require a declared solution representation.")
 
         if problem.problem_family == ProblemFamily.FEATURE_SELECTION:
             if any(variable.variable_type != VariableType.BINARY for variable in problem.variables):

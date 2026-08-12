@@ -1,0 +1,2 @@
+from .structures import ProblemStructureKind, ProblemStructureSpec
+from .representations import SolutionRepresentationKind

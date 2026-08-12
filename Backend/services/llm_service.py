@@ -3,8 +3,11 @@ from __future__ import annotations
 import json
 import os
 import re
+from typing import Optional
 from pathlib import Path
 from typing import Any
+
+from services.graph_problem_classifier import GraphProblemClassifier
 
 from dotenv import load_dotenv
 try:
@@ -48,6 +51,15 @@ REQUIRED_FIELDS = {
     "representation",
     "explanation",
     "assumptions",
+}
+
+OPTIONAL_FIELDS = {
+    "objective_metric",
+    "objective_status",
+    "constraints",
+    "representation_metadata",
+    "problem_structure",
+    "problem_structure_metadata",
 }
 
 SAFE_IDENTIFIER_PATTERN = re.compile(
@@ -138,8 +150,28 @@ class GroqLLMService:
             dataset=dataset,
         )
 
-        result = self._request_model(prompt)
+        try:
+            result = self._request_model(prompt)
+        except ValueError:
+            # Provider JSON failures must not make deterministic graph cases
+            # unusable. The fallback is limited to graph-shaped tabular data
+            # and still passes through the same canonical completion/validation
+            # pipeline. It is not an algorithm-specific compatibility shortcut.
+            result = self._deterministic_graph_fallback(
+                problem_description=problem_description,
+                dataset=dataset,
+            )
         result = self._complete_tabular_model(
+            result=result,
+            problem_description=problem_description,
+            dataset=dataset,
+        )
+        result = self._complete_tabular_constraints(
+            result=result,
+            problem_description=problem_description,
+            dataset=dataset,
+        )
+        result = self._complete_graph_model(
             result=result,
             problem_description=problem_description,
             dataset=dataset,
@@ -169,6 +201,16 @@ class GroqLLMService:
                 problem_description=problem_description,
                 dataset=dataset,
             )
+            repaired_result = self._complete_tabular_constraints(
+                result=repaired_result,
+                problem_description=problem_description,
+                dataset=dataset,
+            )
+            repaired_result = self._complete_graph_model(
+                result=repaired_result,
+                problem_description=problem_description,
+                dataset=dataset,
+            )
 
             self._validate_model(
                 result=repaired_result,
@@ -185,40 +227,181 @@ class GroqLLMService:
         self,
         prompt: str,
     ) -> dict[str, Any]:
+        """Request a JSON model with a resilient transport fallback.
 
-        response = self.client.chat.completions.create(
-            messages=[
-                {
-                    "role": "user",
-                    "content": prompt,
+        Groq has two relevant JSON mechanisms: JSON Object Mode, which is
+        broadly supported, and Structured Outputs, which is available only
+        on a subset of models. The modeling domain must not depend on one
+        transport feature, so this method keeps the fallback policy here
+        instead of spreading provider-specific branches through the domain.
+        """
+        attempts = []
+
+        # GPT-OSS models support Groq Structured Outputs in strict mode.
+        # For other models we deliberately keep JSON Object Mode as the
+        # primary path because it has the broadest model compatibility.
+        if self._supports_strict_structured_output():
+            attempts.append((self._structured_response_format(), prompt))
+
+        attempts.append(({"type": "json_object"}, prompt))
+
+        # Last-resort transport: ask for JSON without response_format and
+        # parse it locally. This is intentionally a provider-boundary fallback
+        # and is never exposed to the rest of the application.
+        attempts.append((None, self._build_compact_json_prompt(prompt)))
+
+        last_error: Exception | None = None
+        for response_format, request_prompt in attempts:
+            try:
+                kwargs: dict[str, Any] = {
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return only one valid JSON object. Do not use markdown fences or commentary.",
+                        },
+                        {
+                            "role": "user",
+                            "content": request_prompt,
+                        },
+                    ],
+                    "model": self.model,
+                    "temperature": 0,
                 }
-            ],
-            model=self.model,
-            temperature=0,
-            response_format={
-                "type": "json_object"
+                if response_format is not None:
+                    kwargs["response_format"] = response_format
+
+                response = self.client.chat.completions.create(**kwargs)
+                content = response.choices[0].message.content or ""
+                result = self._parse_json_object(content)
+                if not isinstance(result, dict):
+                    raise ValueError("Groq returned an invalid problem model.")
+                return result
+            except Exception as exc:
+                last_error = exc
+                if not self._is_json_transport_error(exc):
+                    # Non-format provider errors should not be hidden behind
+                    # additional requests.
+                    raise
+
+        raise ValueError(
+            "The AI provider could not return a valid JSON problem model after "
+            "the supported JSON transport fallbacks were attempted."
+        ) from last_error
+
+    def _supports_strict_structured_output(self) -> bool:
+        return self.model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}
+
+    def _structured_response_format(self) -> dict[str, Any]:
+        """Strict schema accepted by Groq Structured Outputs."""
+        nullable_string = {"type": ["string", "null"]}
+        nullable_number = {"type": ["number", "null"]}
+        variable = {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "variable_type": {"type": "string"},
+                "lower_bound": nullable_number,
+                "upper_bound": nullable_number,
             },
-        )
+            "required": ["name", "variable_type", "lower_bound", "upper_bound"],
+            "additionalProperties": False,
+        }
+        constraint = {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "name": {"type": "string"},
+                "kind": {"type": "string"},
+                "relation": {"type": "string"},
+                "expression": nullable_string,
+                "bound": nullable_number,
+                "lower_bound": nullable_number,
+                "upper_bound": nullable_number,
+                "threshold": nullable_number,
+            },
+            "required": ["id", "name", "kind", "relation", "expression", "bound", "lower_bound", "upper_bound", "threshold"],
+            "additionalProperties": False,
+        }
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "optimization_problem_model",
+                "strict": False,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "problem_family": {"type": "string"},
+                        "mathematical_properties": {"type": "array", "items": {"type": "string"}},
+                        "variables": {"type": "array", "items": variable},
+                        "objective_kind": {"type": "string"},
+                        "objective_sense": {"type": "string"},
+                        "objective_metric": nullable_string,
+                        "objective_status": {"type": "string"},
+                        "expression": {"type": "string"},
+                        "representation": {"type": "string"},
+                        "representation_metadata": {"type": "object", "additionalProperties": True},
+                        "problem_structure": {"type": "string"},
+                        "problem_structure_metadata": {"type": "object", "additionalProperties": True},
+                        "constraints": {"type": "array", "items": constraint},
+                        "explanation": {"type": "string"},
+                        "assumptions": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": [
+                        "name", "description", "problem_family", "mathematical_properties",
+                        "variables", "objective_kind", "objective_sense", "objective_metric",
+                        "objective_status", "expression", "representation", "representation_metadata",
+                        "problem_structure", "problem_structure_metadata", "constraints",
+                        "explanation", "assumptions",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        }
 
-        content = (
-            response.choices[0].message.content
-            or "{}"
-        )
-
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, Any]:
+        text = content.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+            text = re.sub(r"\s*```$", "", text)
         try:
-            result = json.loads(content)
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Some non-structured model paths prepend a short sentence.
+            # Extract only the outermost JSON object without eval/exec.
+            start = text.find("{")
+            end = text.rfind("}")
+            if start < 0 or end <= start:
+                raise ValueError("Groq returned invalid JSON.")
+            parsed = json.loads(text[start:end + 1])
+        if not isinstance(parsed, dict):
+            raise ValueError("Groq returned an invalid problem model.")
+        return parsed
 
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "Groq returned invalid JSON."
-            ) from exc
+    @staticmethod
+    def _is_json_transport_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return any(marker in text for marker in (
+            "json_validate_failed",
+            "failed to validate json",
+            "generated json does not match",
+            "invalid json",
+        ))
 
-        if not isinstance(result, dict):
-            raise ValueError(
-                "Groq returned an invalid problem model."
-            )
-
-        return result
+    @staticmethod
+    def _build_compact_json_prompt(prompt: str) -> str:
+        # Keep the original semantic instructions, but remove the enormous
+        # decorative sections if a provider's JSON mode fails repeatedly.
+        marker = "============================================================\nUSER REQUEST"
+        if marker in prompt:
+            prompt = prompt[prompt.index(marker):]
+        return (
+            "Return ONLY one JSON object matching the optimization model fields "
+            "described in the user request. Preserve explicit decision variables; "
+            "never invent missing numeric parameters.\n\n" + prompt
+        )
 
     # ========================================================
     # Prompt
@@ -605,6 +788,79 @@ Do NOT invent capacity, budget, inventory, warehouse, vehicle, or
 supply constraints without evidence.
 
 ============================================================
+CONSTRAINTS — CRITICAL
+============================================================
+
+Constraints stated explicitly by the user are part of the mathematical
+model and MUST be returned in the "constraints" field.
+
+For a hard inequality such as:
+
+"I cannot spend more than 100"
+"budget is at most 100"
+"cost cannot exceed 100"
+
+construct a constraint with relation "le" and threshold 100.
+
+When the constraint depends on a tabular parameter, use the concrete
+expanded decision variables and dataset values. Example:
+
+40*A + 35*B + 30*C <= 100
+
+must be represented as an expression plus threshold, not merely described
+in natural language.
+
+Never invent a constraint. If a numeric threshold is not explicit or
+reliably present in the dataset, leave the constraint unresolved and
+state the uncertainty in assumptions.
+
+Supported constraint relations:
+- "le" = less than or equal
+- "ge" = greater than or equal
+- "eq" = equal
+
+Each constraint object has:
+{{
+  "id": "safe_identifier",
+  "name": "human readable name",
+  "kind": "hard",
+  "relation": "le|ge|eq",
+  "expression": "...",
+  "lower_bound": null,
+  "upper_bound": null,
+  "threshold": 100
+}}
+
+Use "threshold" for a scalar right-hand side.
+
+============================================================
+OBJECTIVE METRIC
+============================================================
+
+An objective has two layers:
+
+1. objective_sense: minimize or maximize.
+2. objective_metric: the semantic quantity being optimized.
+
+Use an objective_metric when the problem has a native solver whose objective
+is naturally computed from the problem structure and does not need a scalar
+algebraic expression over decision variables.
+
+For graph-native problems use:
+- chinese_postman -> total_distance
+- shortest_path -> path_length
+- minimum_spanning_tree -> total_weight
+- TSP/tour-length problems -> tour_length
+
+For these native graph objectives, expression MUST remain an empty string.
+Do NOT use expression = "0" merely to satisfy a generic expression contract.
+The solver-specific adapter is responsible for evaluating the declared metric.
+
+For expression-based problems such as production planning, knapsack, LP,
+or MILP, objective_metric may be null and expression contains the algebraic
+objective.
+
+============================================================
 SOLUTION REPRESENTATION
 ============================================================
 
@@ -761,6 +1017,30 @@ ALLOWED VALUES
 )}
 
 ============================================================
+GRAPH REPRESENTATIONS
+============================================================
+
+If the problem is naturally a graph problem (roads, vertices, edges,
+routes, networks, shortest paths, Chinese Postman, spanning trees),
+use representation = "graph".
+
+When representation = "graph", representation_metadata should describe
+the graph without inventing values. Prefer: nodes, edges, directed,
+graph_problem_type, source, target. Each edge should contain id, u, v,
+weight, and optionally required.
+
+Supported graph_problem_type values include:
+- chinese_postman
+- shortest_path
+- minimum_spanning_tree
+- tsp
+- generic
+
+For a tabular edge dataset, use the row values as graph data. Common
+column aliases are id/edge_id, u/from/source, v/to/target, and
+weight/cost/distance. Do not invent missing edge weights.
+
+============================================================
 OUTPUT
 ============================================================
 
@@ -783,8 +1063,26 @@ Use exactly these top-level fields:
     ],
     "objective_kind": "single or multi",
     "objective_sense": "minimize or maximize",
+    "objective_metric": "semantic metric or null",
+    "objective_status": "complete|incomplete|not_applicable",
     "expression": "mathematical expression or empty string",
     "representation": "one allowed representation or empty string",
+    "representation_metadata": {{}},
+    "problem_structure": "tabular|vector|graph|matrix|generic",
+    "problem_structure_metadata": {{}},
+    "constraints": [
+        {{
+            "id": "safe_identifier",
+            "name": "human readable name",
+            "kind": "hard",
+            "relation": "le|ge|eq",
+            "expression": "...",
+            "bound": null,
+            "lower_bound": null,
+            "upper_bound": null,
+            "threshold": null
+        }}
+    ],
     "explanation": "plain-language explanation",
     "assumptions": [
         "assumptions or uncertainties"
@@ -948,6 +1246,112 @@ Use exactly these top-level fields:
         )
         completed["explanation"] = f"{explanation} {completion_note}".strip()
         return completed
+
+    def _complete_tabular_constraints(
+        self,
+        result: dict[str, Any],
+        problem_description: str,
+        dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Materialize explicit budget/cost limits using tabular parameters.
+
+        This is deliberately conservative: the numeric limit must come from
+        the user's text, while coefficients must come from the dataset.
+        """
+        if not isinstance(result, dict) or not result.get("variables"):
+            return result
+        if dataset.get("rows_truncated"):
+            return result
+        rows = dataset.get("rows") or dataset.get("sample_rows") or []
+        columns = [str(item).strip() for item in dataset.get("columns", []) if str(item).strip()]
+        if not rows or not columns:
+            return result
+
+        description = self._normalize_text(problem_description)
+        threshold = self._extract_budget_limit(problem_description)
+        if threshold is None:
+            return result
+
+        cost_column = self._find_column(columns, ("cost", "custo", "price", "preco", "expense", "despesa", "investment", "investimento"))
+        entity_column = self._find_entity_column(rows, columns)
+        if cost_column is None or entity_column is None:
+            return result
+
+        variables = result.get("variables", [])
+        if not variables:
+            return result
+
+        terms: list[str] = []
+        variable_names = {item.get("name") for item in variables if isinstance(item, dict)}
+        for row in rows:
+            if not isinstance(row, dict):
+                return result
+            entity = row.get(entity_column)
+            cost = self._to_number(row.get(cost_column))
+            if entity is None or cost is None:
+                return result
+            entity_text = str(entity).strip()
+            exact = self._safe_variable_name(entity_text)
+            matching = [
+                name for name in variable_names
+                if name == exact or name.endswith(f"_{exact}")
+            ]
+            if len(matching) != 1:
+                return result
+            name = matching[0]
+            terms.append(f"{self._format_number(cost)}*{name}")
+
+        if not terms:
+            return result
+
+        constraints = list(result.get("constraints") or [])
+        if any(str(item.get("id", "")) == "budget_limit" for item in constraints if isinstance(item, dict)):
+            return result
+
+        constraints.append({
+            "id": "budget_limit",
+            "name": "Budget limit",
+            "kind": "hard",
+            "relation": "le",
+            "expression": " + ".join(terms),
+            "lower_bound": None,
+            "upper_bound": None,
+            "threshold": threshold,
+        })
+
+        completed = dict(result)
+        completed["constraints"] = constraints
+        properties = list(completed.get("mathematical_properties") or [])
+        for prop in ("linear", "constrained"):
+            if prop not in properties:
+                properties.append(prop)
+        completed["mathematical_properties"] = properties
+        assumptions = list(completed.get("assumptions") or [])
+        assumptions.append(f"The user's budget limit is modeled as a hard constraint of {self._format_number(threshold)} using the '{cost_column}' dataset column.")
+        completed["assumptions"] = self._unique_strings(assumptions)
+        return completed
+
+    def _extract_budget_limit(self, text: str) -> float | None:
+        patterns = (
+            r"(?:nao posso|não posso|nao devo|não devo)\s+(?:gastar|investir)\s+(?:mais de|acima de)\s*([0-9]+(?:[.,][0-9]+)?)\s*(mil|milhao|milhoes|k|m)?",
+            r"(?:orcamento|orçamento|budget|verba)\s+(?:e|é|de|igual a|no maximo de|no máximo de|ate|até)\s*([0-9]+(?:[.,][0-9]+)?)\s*(mil|milhao|milhoes|k|m)?",
+            r"(?:nao posso|não posso|nao devo|não devo)\s+(?:ultrapassar|exceder)\s*([0-9]+(?:[.,][0-9]+)?)\s*(mil|milhao|milhoes|k|m)?",
+            r"(?:at most|no more than|maximum of|cannot exceed|cannot spend more than)\s*([0-9]+(?:[.,][0-9]+)?)\s*(k|m)?",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = self._to_number(match.group(1))
+            if value is None:
+                continue
+            unit = (match.group(2) or "").lower()
+            if unit in {"mil", "k"}:
+                value *= 1000
+            elif unit in {"milhao", "milhoes", "m"}:
+                value *= 1_000_000
+            return value
+        return None
 
     @staticmethod
     def _normalize_text(value: Any) -> str:
@@ -1184,12 +1588,208 @@ Return ONLY valid JSON with exactly these fields:
     "variables": [],
     "objective_kind": "...",
     "objective_sense": "...",
+    "objective_metric": null,
     "expression": "",
+    "constraints": [],
     "representation": "",
+    "representation_metadata": {{}},
+    "problem_structure": "tabular|vector|graph|matrix|generic",
+    "problem_structure_metadata": {{}},
     "explanation": "...",
     "assumptions": []
 }}
 """
+
+    def _deterministic_graph_fallback(
+        self,
+        problem_description: str,
+        dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build a minimal graph model when the provider cannot emit JSON.
+
+        This is intentionally data-driven: it recognizes the graph shape from
+        the dataset and derives only the semantic family/metric from the
+        centralized graph classifier. No solver or algorithm is selected here.
+        """
+        rows = dataset.get("rows") or dataset.get("sample_rows") or []
+        if not isinstance(rows, list) or not rows:
+            raise ValueError("The AI provider failed and the dataset is not graph-shaped enough for deterministic fallback.")
+
+        classifier = GraphProblemClassifier()
+        classification = classifier.classify(problem_description)
+        if classification.kind == "generic":
+            raise ValueError("The AI provider failed and the graph problem family could not be determined deterministically.")
+
+        return {
+            "name": classification.kind.replace("_", " ").title(),
+            "description": problem_description.strip(),
+            "problem_family": "graph_optimization",
+            "mathematical_properties": ["discrete", "combinatorial"],
+            "variables": [{"name": "route", "variable_type": "discrete", "lower_bound": None, "upper_bound": None}],
+            "objective_kind": "single",
+            "objective_sense": "minimize",
+            "objective_metric": {
+                "tsp": "tour_length",
+                "shortest_path": "path_length",
+                "minimum_spanning_tree": "total_weight",
+                "chinese_postman": "total_distance",
+            }.get(classification.kind, "custom"),
+            "objective_status": "complete",
+            "expression": "",
+            "representation": "graph",
+            "representation_metadata": {},
+            "problem_structure": "graph",
+            "problem_structure_metadata": {},
+            "constraints": [],
+            "explanation": "Graph problem modeled deterministically from the natural-language request and edge dataset after provider JSON generation failed.",
+            "assumptions": ["The supplied edge table represents the graph instance."]
+        }
+
+    # ========================================================
+    # Deterministic graph completion
+    # ========================================================
+
+    def _complete_graph_model(
+        self,
+        result: dict[str, Any],
+        problem_description: str,
+        dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Normalize an edge table into graph metadata without inventing data."""
+        if not isinstance(result, dict) or (result.get("representation") != "graph" and result.get("problem_structure") != "graph"):
+            return result
+        rows = dataset.get("rows") or dataset.get("sample_rows") or []
+        if not isinstance(rows, list) or not rows:
+            return result
+        if dataset.get("rows_truncated"):
+            return result
+
+        def pick(row, aliases):
+            lowered = {str(key).lower(): key for key in row}
+            for alias in aliases:
+                if alias in lowered:
+                    return row[lowered[alias]]
+            return None
+
+        edges = []
+        nodes = set()
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                return result
+            u = pick(row, ("u", "from", "source", "origin"))
+            v = pick(row, ("v", "to", "target", "destination"))
+            weight = pick(row, ("weight", "cost", "distance", "length"))
+            edge_id = pick(row, ("id", "edge_id", "edge", "arc"))
+            if u is None or v is None or weight is None:
+                return result
+            if edge_id is None:
+                edge_id = f"e{index + 1}"
+            try:
+                numeric_weight = float(weight)
+            except (TypeError, ValueError):
+                return result
+            if numeric_weight < 0:
+                return result
+            edges.append({"id": edge_id, "u": u, "v": v, "weight": numeric_weight, "required": True})
+            nodes.add(u)
+            nodes.add(v)
+
+        completed = dict(result)
+        metadata = dict(completed.get("problem_structure_metadata") or {})
+        legacy_metadata = dict(completed.get("representation_metadata") or {})
+        metadata = {**legacy_metadata, **metadata}
+        metadata.setdefault("nodes", list(nodes))
+        metadata["edges"] = edges
+        metadata.setdefault("directed", False)
+        description = f"{problem_description} {completed.get('description', '')}".lower()
+
+        # Source/target are semantic graph parameters, not edge-column names.
+        # Preserve them when the model already identified them; otherwise
+        # infer them only from explicit natural-language endpoint patterns.
+        # This prevents the validation layer from turning a valid shortest-path
+        # request into a misleading "0 compatible algorithms" result.
+        if metadata.get("source") is None or metadata.get("target") is None:
+            endpoint_patterns = (
+                r"\bfrom\s+([^,.;]+?)\s+to\s+([^,.;]+)",
+                r"\bde\s+([^,.;]+?)\s+para\s+([^,.;]+)",
+                r"\bentre\s+([^,.;]+?)\s+e\s+([^,.;]+)",
+                r"\bentre\s+([^,.;]+?)\s+até\s+([^,.;]+)",
+                r"\bentre\s+([^,.;]+?)\s+ate\s+([^,.;]+)",
+            )
+            for pattern in endpoint_patterns:
+                match = re.search(pattern, description, flags=re.IGNORECASE)
+                if not match:
+                    continue
+                source_text = match.group(1).strip().strip('\"\'')
+                target_text = match.group(2).strip().strip('\"\'')
+                node_lookup = {str(node).strip().lower(): node for node in nodes}
+                source_value = node_lookup.get(source_text.lower(), source_text)
+                target_value = node_lookup.get(target_text.lower(), target_text)
+                if source_value in nodes and target_value in nodes and source_value != target_value:
+                    metadata["source"] = source_value
+                    metadata["target"] = target_value
+                break
+        graph_type = metadata.get("graph_problem_type")
+        if graph_type in (None, "", "generic"):
+            classification = GraphProblemClassifier().classify(
+                problem_description,
+                completed.get("description", ""),
+                completed.get("name", ""),
+            )
+            graph_type = classification.kind
+        metadata["graph_problem_type"] = graph_type
+
+        # Graph-native solvers do not optimize one variable per edge.
+        # The graph itself is the instance; the decision is the traversal
+        # returned by the graph solver. LLMs may otherwise hallucinate
+        # variables such as edge_count_AB, which then collide with the
+        # generic integer-domain and routing validators. Normalize the
+        # semantic model here so graph problems have one discrete route
+        # variable and the graph data remains exclusively in metadata.
+        completed["problem_family"] = "graph_optimization"
+        completed["representation"] = "graph"
+        completed["variables"] = [{
+            "name": "route",
+            "variable_type": "discrete",
+            "lower_bound": None,
+            "upper_bound": None,
+        }]
+        # Native graph solvers calculate the objective from the graph.
+        # Do not invent a fake algebraic expression just to satisfy
+        # expression-based solvers. The semantic metric is the contract.
+        if graph_type == "chinese_postman":
+            objective_metric = "total_distance"
+        elif graph_type == "shortest_path":
+            objective_metric = "path_length"
+        elif graph_type == "minimum_spanning_tree":
+            objective_metric = "total_weight"
+        elif graph_type == "tsp":
+            # TSP is a tour problem, not a generic weighted graph objective.
+            # Normalize even when the LLM supplied a generic metric such as
+            # total_distance so capability matching can target tour solvers.
+            objective_metric = "tour_length"
+        else:
+            objective_metric = completed.get("objective_metric")
+        completed["objective_metric"] = objective_metric
+        completed["expression"] = ""
+        # Native graph constraints are structural (required edges, source/target,
+        # connectivity, etc.), not algebraic constraints over scalar variables.
+        # Preserve the LLM proposal in graph metadata instead of sending edge
+        # identifiers such as e1/e2/e3 through the generic expression parser.
+        graph_constraints = completed.get("constraints") or []
+        if graph_constraints:
+            metadata["graph_constraints"] = list(graph_constraints)
+            completed["constraints"] = []
+        completed["objective_status"] = "complete" if objective_metric else "incomplete"
+        completed["mathematical_properties"] = [
+            "discrete",
+            "combinatorial",
+        ]
+        completed["problem_structure"] = "graph"
+        completed["problem_structure_metadata"] = metadata
+        # Keep the legacy metadata synchronized so older clients keep working.
+        completed["representation_metadata"] = dict(metadata)
+        return completed
 
     # ========================================================
     # Validation
@@ -1201,6 +1801,8 @@ Return ONLY valid JSON with exactly these fields:
         dataset: dict[str, Any],
     ) -> None:
 
+        result["objective_status"] = self._derive_objective_status(result)
+
         self._validate_top_level_fields(result)
 
         self._validate_basic_fields(result)
@@ -1211,6 +1813,11 @@ Return ONLY valid JSON with exactly these fields:
 
         self._validate_expression(
             expression=result["expression"],
+            variables=result["variables"],
+        )
+
+        self._validate_constraints(
+            constraints=result.get("constraints", []),
             variables=result["variables"],
         )
 
@@ -1238,7 +1845,7 @@ Return ONLY valid JSON with exactly these fields:
                 + ", ".join(sorted(missing))
             )
 
-        unexpected = result.keys() - REQUIRED_FIELDS
+        unexpected = result.keys() - REQUIRED_FIELDS - OPTIONAL_FIELDS
 
         if unexpected:
             raise ValueError(
@@ -1280,6 +1887,24 @@ Return ONLY valid JSON with exactly these fields:
             raise ValueError(
                 "objective_sense must be 'minimize' or 'maximize'."
             )
+
+        if result.get("objective_status") not in {
+            "complete",
+            "incomplete",
+            "not_applicable",
+        }:
+            raise ValueError(
+                "objective_status must be 'complete', 'incomplete' or 'not_applicable'."
+            )
+
+        objective_metric = result.get("objective_metric")
+        if objective_metric is not None:
+            allowed_metrics = {
+                "total_distance", "total_cost", "total_return", "tour_length",
+                "path_length", "total_weight", "mse", "mae", "custom",
+            }
+            if objective_metric not in allowed_metrics:
+                raise ValueError(f"Unsupported objective_metric '{objective_metric}'.")
 
         if not isinstance(
             result["mathematical_properties"],
@@ -1447,6 +2072,81 @@ Return ONLY valid JSON with exactly these fields:
                     "Expression contains forbidden content."
                 )
 
+    def _validate_constraints(
+        self,
+        constraints: Any,
+        variables: list[dict[str, Any]],
+    ) -> None:
+        if constraints is None:
+            return
+        if not isinstance(constraints, list):
+            raise ValueError("'constraints' must be a list.")
+
+        seen: set[str] = set()
+        allowed_relations = {"le", "ge", "eq"}
+        variable_names = {variable["name"] for variable in variables}
+
+        for constraint in constraints:
+            if not isinstance(constraint, dict):
+                raise ValueError("Each constraint must be an object.")
+
+            required = {"id", "name", "kind", "relation"}
+            missing = required - constraint.keys()
+            if missing:
+                raise ValueError("Constraint is missing fields: " + ", ".join(sorted(missing)))
+
+            cid = constraint["id"]
+            if not isinstance(cid, str) or not SAFE_IDENTIFIER_PATTERN.match(cid):
+                raise ValueError(f"Invalid constraint id '{cid}'.")
+            if cid in seen:
+                raise ValueError(f"Duplicate constraint '{cid}'.")
+            seen.add(cid)
+
+            if constraint["kind"] != "hard":
+                raise ValueError("Only hard constraints are currently executable.")
+            relation = constraint["relation"]
+            if relation not in allowed_relations:
+                raise ValueError("Constraint relation must be 'le', 'ge' or 'eq'.")
+
+            expression = constraint.get("expression")
+            if not isinstance(expression, str) or not expression.strip():
+                raise ValueError(f"Constraint '{cid}' must define an expression.")
+            self._validate_expression(expression=expression, variables=variables)
+
+            # A constraint has one semantic target. Legacy bound fields remain
+            # accepted for compatibility, but none of them is mandatory when
+            # another valid target is present.
+            bound = constraint.get("bound")
+            threshold = constraint.get("threshold")
+            lower = constraint.get("lower_bound")
+            upper = constraint.get("upper_bound")
+            has_target = bound is not None or threshold is not None or lower is not None or upper is not None
+            if not has_target:
+                raise ValueError(f"Constraint '{cid}' needs a bound/threshold.")
+
+            if relation == "le" and bound is None and threshold is None and upper is None:
+                raise ValueError(f"Constraint '{cid}' with relation 'le' needs an upper bound or threshold.")
+            if relation == "ge" and bound is None and threshold is None and lower is None:
+                raise ValueError(f"Constraint '{cid}' with relation 'ge' needs a lower bound or threshold.")
+            if relation == "eq" and bound is None and threshold is None and not (lower is not None and upper is not None and lower == upper):
+                raise ValueError(f"Constraint '{cid}' with relation 'eq' needs a bound or threshold.")
+
+    def _derive_objective_status(self, result: dict[str, Any]) -> str:
+        """Derive objective completeness without fabricating missing math."""
+        variables = result.get("variables") or []
+        kind = result.get("objective_kind", "single")
+        expression = str(result.get("expression") or "").strip()
+        metric = result.get("objective_metric")
+
+        if not variables:
+            return "not_applicable"
+
+        if kind == "multi":
+            objectives = result.get("objectives") or []
+            return "complete" if len(objectives) >= 2 else "incomplete"
+
+        return "complete" if expression or metric else "incomplete"
+
     # ========================================================
     # Completeness
     # ========================================================
@@ -1479,6 +2179,8 @@ Return ONLY valid JSON with exactly these fields:
         variables = result["variables"]
         expression = result["expression"].strip()
         representation = result["representation"]
+        objective_metric = result.get("objective_metric")
+        objective_status = result.get("objective_status") or self._derive_objective_status(result)
 
         # ----------------------------------------------------
         # No decision variables
@@ -1512,6 +2214,17 @@ Return ONLY valid JSON with exactly these fields:
 
         if not expression:
 
+            if objective_status != "incomplete" and objective_metric is None:
+                raise ValueError("Objective status is inconsistent with the objective fields.")
+
+            if objective_metric is not None:
+                if representation in {"", None}:
+                    raise ValueError(
+                        "A metric-based objective with decision variables "
+                        "must declare a solution representation."
+                    )
+                return
+
             if representation in {"", None}:
                 raise ValueError(
                     "A model with identified decision variables "
@@ -1535,6 +2248,8 @@ Return ONLY valid JSON with exactly these fields:
                 "A model with decision variables and an objective "
                 "expression must declare a solution representation."
             )
+        if objective_status != "complete":
+            raise ValueError("Objective status is inconsistent with a complete objective.")
 
     # ========================================================
     # Allowed values
@@ -1596,6 +2311,22 @@ Return ONLY valid JSON with exactly these fields:
                 f"Invalid representation "
                 f"'{result['representation']}'. "
                 f"Allowed values: {allowed_representations}"
+            )
+
+        # ----------------------------------------------------
+        # Problem structure
+        # ----------------------------------------------------
+
+        allowed_structures = allowed.get("problem_structures")
+        if (
+            isinstance(allowed_structures, list)
+            and allowed_structures
+            and result.get("problem_structure") not in {"", None}
+            and result.get("problem_structure") not in allowed_structures
+        ):
+            raise ValueError(
+                f"Invalid problem_structure '{result.get('problem_structure')}'. "
+                f"Allowed values: {allowed_structures}"
             )
 
         # ----------------------------------------------------

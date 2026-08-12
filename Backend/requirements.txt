@@ -2,7 +2,6 @@ fastapi>=0.100.0
 uvicorn>=0.22.0
 pydantic>=2.0.0
 groq>=0.4.0
-pygad>=3.0.0
 numpy>=1.22.0
 pandas>=2.0.0
 python-dotenv>=1.0.0

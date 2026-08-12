@@ -455,3 +455,10 @@ library.
 
 -   `../README.md`
 -   `../Frontend/README.md`
+
+## V12 semantic modeling
+
+V12 introduces explicit objective completeness (`complete`, `incomplete`,
+`not_applicable`) and a semantic constraint target (`bound`) while preserving
+legacy constraint bound fields for compatibility. Incomplete objectives are
+modeling states, not solver incompatibilities.

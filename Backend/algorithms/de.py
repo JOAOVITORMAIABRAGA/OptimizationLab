@@ -1,72 +1,72 @@
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, List, Tuple
+
 import numpy as np
-from typing import Callable, Tuple, List, Dict, Any
+
 from .base import OptimizationAlgorithm
 from schemas import AlgorithmConfig
 
 
 class DifferentialEvolution(OptimizationAlgorithm):
-    def __init__(self):
-        self.population_size: int = 40
-        self.iterations: int = 80
-        self.mutation_factor: float = 0.8
-        self.crossover_rate: float = 0.7
+    """Native Differential Evolution using the classic DE/rand/1/bin strategy."""
 
-    def configure(self, config: AlgorithmConfig) -> None:
+    def __init__(self, seed: int = 11):
+        self.seed = seed
+        self.population_size = 40
+        self.iterations = 80
+        self.mutation_factor = 0.8
+        self.crossover_rate = 0.7
+
+    def configure(self, config: AlgorithmConfig | None) -> None:
         if config is not None and config.de_params:
             self.population_size = config.de_params.population_size
             self.iterations = config.de_params.iterations
             self.mutation_factor = config.de_params.mutation_factor
             self.crossover_rate = config.de_params.crossover_rate
 
-    def optimize(
-        self,
-        fitness_function: Callable,
-        bounds: List[Tuple[float, float]],
-        is_minimization: bool = True,
-        constraints: List[Callable] = None,
-    ) -> Tuple[List[float], float]:
-        low = np.array([b[0] for b in bounds], dtype=float)
-        high = np.array([b[1] for b in bounds], dtype=float)
-        rng = np.random.default_rng(11)
+    def optimize(self, fitness_function: Callable, bounds: List[Tuple[float, float]], is_minimization: bool = True, constraints=None):
+        if self.population_size < 4:
+            raise ValueError("DE population size must be at least 4.")
+        rng = np.random.default_rng(self.seed)
+        low = np.asarray([b[0] for b in bounds], dtype=float)
+        high = np.asarray([b[1] for b in bounds], dtype=float)
+        n = len(bounds)
 
-        population = rng.uniform(low, high, size=(self.population_size, len(bounds)))
-        scores = np.array([self._evaluate(fitness_function, constraints, is_minimization, p) for p in population], dtype=float)
+        def evaluate(x):
+            if constraints and any(not c(x.tolist()) for c in constraints):
+                return np.inf if is_minimization else -np.inf
+            value = float(fitness_function(x.tolist()))
+            return value if np.isfinite(value) else (np.inf if is_minimization else -np.inf)
 
-        best_idx = np.argmin(scores) if is_minimization else np.argmax(scores)
-        best_solution = population[best_idx].copy()
-        best_score = scores[best_idx]
+        population = rng.uniform(low, high, size=(self.population_size, n))
+        scores = np.asarray([evaluate(x) for x in population])
+        best_idx = int(np.argmin(scores) if is_minimization else np.argmax(scores))
+        best = population[best_idx].copy()
+        best_score = float(scores[best_idx])
+        history = [best_score]
 
         for _ in range(self.iterations):
             for i in range(self.population_size):
-                candidates = [j for j in range(self.population_size) if j != i]
-                a, b, c = population[rng.choice(candidates, size=3, replace=False)]
-                mutant = a + self.mutation_factor * (b - c)
+                choices = [j for j in range(self.population_size) if j != i]
+                a, b, c = population[rng.choice(choices, size=3, replace=False)]
+                mutant = np.clip(a + self.mutation_factor * (b - c), low, high)
                 trial = population[i].copy()
-                cross_points = rng.random(len(bounds)) < self.crossover_rate
-                if not np.any(cross_points):
-                    cross_points[rng.integers(0, len(bounds))] = True
-                trial[cross_points] = mutant[cross_points]
-                trial = np.clip(trial, low, high)
-                trial_score = self._evaluate(fitness_function, constraints, is_minimization, trial)
-
-                if (trial_score < scores[i]) if is_minimization else (trial_score > scores[i]):
+                mask = rng.random(n) < self.crossover_rate
+                mask[rng.integers(0, n)] = True
+                trial[mask] = mutant[mask]
+                score = evaluate(trial)
+                if (score < scores[i]) if is_minimization else (score > scores[i]):
                     population[i] = trial
-                    scores[i] = trial_score
-                    if (trial_score < best_score) if is_minimization else (trial_score > best_score):
-                        best_score = trial_score
-                        best_solution = trial.copy()
+                    scores[i] = score
+                    if (score < best_score) if is_minimization else (score > best_score):
+                        best = trial.copy()
+                        best_score = float(score)
+            history.append(best_score)
 
-        return best_solution.tolist(), float(best_score)
-
-    def _evaluate(self, fitness_function, constraints, is_minimization, solution):
-        if constraints:
-            for constraint_func in constraints:
-                if not constraint_func(solution.tolist()):
-                    return float("inf") if is_minimization else float("-inf")
-        value = float(fitness_function(solution.tolist()))
-        if not np.isfinite(value):
-            return float("inf") if is_minimization else float("-inf")
-        return value
+        self._last_iterations = self.iterations
+        self._last_history = history
+        return best.tolist(), best_score
 
     def get_params_report(self) -> Dict[str, Any]:
         return {
@@ -74,5 +74,5 @@ class DifferentialEvolution(OptimizationAlgorithm):
             "iterations": self.iterations,
             "mutation_factor": self.mutation_factor,
             "crossover_rate": self.crossover_rate,
-            "engine": "Differential Evolution",
+            "engine": "OptimizationLab native Differential Evolution",
         }

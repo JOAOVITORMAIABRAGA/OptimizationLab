@@ -4,14 +4,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from schemas import AlgorithmConfig
 from .base import OptimizationAlgorithm
-from adapters.solver_adapter import OptimizationProblemAdapter, OrToolsConstraintProgrammingAdapter, ScipyLinearProgrammingAdapter, ScipyMixedIntegerAdapter, cp_model
+from domain.solutions import OptimizationResult
+from time import perf_counter
+from adapters.solver_adapter import ClassicalModelAdapter, OrToolsConstraintProgrammingAdapter, ScipyLinearProgrammingAdapter, ScipyMixedIntegerAdapter, cp_model
 from domain.problem import OptimizationProblem
 from domain.variables import VariableType
 
 
 class _ClassicalSolver(OptimizationAlgorithm):
     def __init__(self) -> None:
-        self.adapter = OptimizationProblemAdapter()
+        self.adapter = ClassicalModelAdapter()
         self.last_backend = ""
 
     def configure(self, config: Optional[AlgorithmConfig]) -> None:
@@ -28,6 +30,32 @@ class _ClassicalSolver(OptimizationAlgorithm):
                 "Legacy fitness-function execution is intentionally unsupported for exact solvers."
             )
         return self._solve_problem(problem)
+
+    def optimize_problem(self, problem: OptimizationProblem):
+        return self.optimize_problem_result(problem).solution
+
+    def optimize_problem_result(self, problem: OptimizationProblem):
+        from domain.solutions import CandidateSolution
+        from domain.representations import SolutionRepresentationKind
+        start = perf_counter()
+        solution, value = self.optimize(problem)
+        candidate = CandidateSolution(
+            values={variable.name: value_ for variable, value_ in zip(problem.variables, solution)},
+            representation=problem.solution_representation.kind if problem.solution_representation else SolutionRepresentationKind.VECTOR,
+            objective_value=float(value),
+            feasible=True,
+        )
+        return OptimizationResult(
+            solution=candidate,
+            objective_value=float(value),
+            feasible=True,
+            iterations=1,
+            evaluations=1,
+            runtime_seconds=perf_counter() - start,
+            convergence_history=(float(value),),
+            algorithm=self.__class__.__name__,
+            parameters=self.get_params_report(),
+        )
 
     def get_params_report(self) -> Dict[str, Any]:
         return {"engine": self.last_backend}

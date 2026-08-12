@@ -7,7 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from groq import Groq
+try:
+    from groq import Groq
+except ImportError:  # Optional until an LLM call is actually requested.
+    Groq = None  # type: ignore[assignment]
 
 
 # ============================================================
@@ -136,6 +139,11 @@ class GroqLLMService:
         )
 
         result = self._request_model(prompt)
+        result = self._complete_tabular_model(
+            result=result,
+            problem_description=problem_description,
+            dataset=dataset,
+        )
 
         try:
             self._validate_model(
@@ -155,6 +163,11 @@ class GroqLLMService:
 
             repaired_result = self._request_model(
                 repair_prompt
+            )
+            repaired_result = self._complete_tabular_model(
+                result=repaired_result,
+                problem_description=problem_description,
+                dataset=dataset,
             )
 
             self._validate_model(
@@ -362,6 +375,53 @@ Do NOT use spaces, parentheses, brackets, or other invalid syntax
 in variable names.
 
 The dimensions can be described in the explanation or assumptions.
+
+============================================================
+TABULAR DATASETS AND INDEXED DECISIONS
+============================================================
+
+When the dataset contains one row per decision entity and the user asks
+for a quantity for each entity, the scalar executable model MUST expand
+the indexed concept into one safe variable per row when the current
+OptimizationProblem contract requires scalar variables.
+
+Example:
+
+Dataset:
+product,profit_per_unit,min_quantity,max_quantity
+A,20,0,40
+B,15,0,50
+C,30,0,35
+D,10,0,45
+
+User:
+"I need to decide how much to produce of each product to maximize profit."
+
+Conceptual decision:
+produce_qty(product)
+
+Executable scalar variables:
+produce_qty_A
+produce_qty_B
+produce_qty_C
+produce_qty_D
+
+Objective:
+20*produce_qty_A + 15*produce_qty_B + 30*produce_qty_C + 10*produce_qty_D
+
+Bounds:
+produce_qty_A: 0..40
+produce_qty_B: 0..50
+produce_qty_C: 0..35
+produce_qty_D: 0..45
+
+The numeric dataset columns are parameters, not decision variables.
+Their values may be embedded as coefficients or bounds in the declarative
+model when the row/entity mapping is unambiguous. Never invent values.
+
+If the dataset is insufficient to construct the complete expression, keep
+the decision variable(s) and leave expression empty rather than fabricating
+parameters.
 
 ============================================================
 MODEL COMPLETENESS
@@ -731,6 +791,288 @@ Use exactly these top-level fields:
     ]
 }}
 """
+
+    # ========================================================
+    # Deterministic tabular completion
+    # ========================================================
+
+    def _complete_tabular_model(
+        self,
+        result: dict[str, Any],
+        problem_description: str,
+        dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Completes a model when a tabular dataset provides all numerical
+        parameters needed to expand an indexed decision into concrete
+        scalar variables.
+
+        The LLM remains responsible for understanding the user's intent.
+        This layer only performs a deterministic, auditable transformation
+        from rows/parameters to the scalar declarative model consumed by
+        OptimizationProblem. It never invents numerical values.
+        """
+        if dataset.get("rows_truncated"):
+            return result
+        rows = dataset.get("rows") or dataset.get("sample_rows") or []
+        if not isinstance(rows, list) or len(rows) < 1:
+            return result
+        if not isinstance(result, dict) or not result.get("variables"):
+            return result
+
+        columns = [str(item).strip() for item in dataset.get("columns", []) if str(item).strip()]
+        normalized_columns = {self._normalize_text(column): column for column in columns}
+        description_text = self._normalize_text(problem_description)
+
+        # We only expand when the request clearly describes a row-wise
+        # quantity decision (production, shipping, allocation, etc.).
+        action = self._infer_rowwise_quantity_action(description_text)
+        if action is None:
+            return result
+
+        entity_column = self._find_entity_column(rows, columns)
+        if entity_column is None:
+            return result
+
+        coefficient_column, sense = self._find_objective_parameter(
+            rows=rows,
+            columns=columns,
+            description_text=description_text,
+            current_sense=result.get("objective_sense"),
+        )
+        if coefficient_column is None:
+            return result
+
+        lower_column = self._find_column(columns, ("min_quantity", "minimum_quantity", "min_qty", "lower_bound", "minimum", "min"))
+        upper_column = self._find_column(columns, ("max_quantity", "maximum_quantity", "max_qty", "upper_bound", "maximum", "max", "capacity"))
+        if lower_column is None and upper_column is None:
+            return result
+
+        # If the model already has multiple scalar variables, leave it alone.
+        # This completion is intended for the common indexed-variable case.
+        variables = result.get("variables", [])
+        if len(variables) != 1:
+            return result
+
+        base_variable = variables[0]
+        base_name = str(base_variable.get("name") or action)
+        expanded_variables: list[dict[str, Any]] = []
+        terms: list[str] = []
+        seen_entities: set[str] = set()
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_entity = row.get(entity_column)
+            if raw_entity is None or str(raw_entity).strip() == "":
+                continue
+            entity = str(raw_entity).strip()
+            if entity in seen_entities:
+                continue
+            coefficient = self._to_number(row.get(coefficient_column))
+            if coefficient is None:
+                return result
+
+            lower = self._to_number(row.get(lower_column)) if lower_column else None
+            upper = self._to_number(row.get(upper_column)) if upper_column else None
+            if lower is None and upper is None:
+                return result
+            if lower is None:
+                lower = 0.0
+            if upper is None:
+                return result
+            if lower > upper:
+                return result
+
+            variable_name = self._safe_variable_name(f"{base_name}_{entity}")
+            if variable_name in {item["name"] for item in expanded_variables}:
+                return result
+            expanded_variables.append({
+                "name": variable_name,
+                "variable_type": base_variable.get("variable_type") or "integer",
+                "lower_bound": lower,
+                "upper_bound": upper,
+            })
+            coefficient_text = self._format_number(coefficient)
+            term = f"{coefficient_text}*{variable_name}"
+            terms.append(term)
+            seen_entities.add(entity)
+
+        if not expanded_variables or not terms:
+            return result
+
+        # Preserve explicit model semantics, but correct the sense when the
+        # request unambiguously says profit/revenue/cost and the draft was
+        # incomplete or defaulted.
+        objective_sense = sense or result.get("objective_sense") or "maximize"
+        objective_expression = " + ".join(terms)
+
+        completed = dict(result)
+        completed["variables"] = expanded_variables
+        completed["objective_sense"] = objective_sense
+        completed["objective_kind"] = result.get("objective_kind") or "single"
+        completed["expression"] = objective_expression
+        completed["representation"] = result.get("representation") or "vector"
+        completed["problem_family"] = self._infer_problem_family(
+            result.get("problem_family"), action, description_text
+        )
+
+        properties = list(result.get("mathematical_properties") or [])
+        variable_type = expanded_variables[0]["variable_type"]
+        for prop in ("linear", "constrained"):
+            if prop not in properties:
+                properties.append(prop)
+        if variable_type == "integer" and "integer" not in properties:
+            properties.append("integer")
+        elif variable_type == "binary" and "binary" not in properties:
+            properties.append("binary")
+        elif variable_type == "continuous" and "continuous" not in properties:
+            properties.append("continuous")
+        completed["mathematical_properties"] = properties
+
+        assumptions = list(result.get("assumptions") or [])
+        assumptions.append(
+            f"The '{entity_column}' column defines the decision entities; "
+            f"'{coefficient_column}' is used as the per-entity objective coefficient."
+        )
+        if lower_column:
+            assumptions.append(f"'{lower_column}' supplies the lower production bound for each entity.")
+        if upper_column:
+            assumptions.append(f"'{upper_column}' supplies the upper production bound for each entity.")
+        completed["assumptions"] = self._unique_strings(assumptions)
+
+        explanation = str(result.get("explanation") or "").strip()
+        completion_note = (
+            f"The tabular dataset defines one decision quantity per {entity_column}; "
+            f"the objective is expanded using {coefficient_column}."
+        )
+        completed["explanation"] = f"{explanation} {completion_note}".strip()
+        return completed
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str:
+        text = str(value or "").strip().lower()
+        replacements = {
+            "á": "a", "à": "a", "ã": "a", "â": "a", "ä": "a",
+            "é": "e", "ê": "e", "ë": "e",
+            "í": "i", "ï": "i",
+            "ó": "o", "õ": "o", "ô": "o", "ö": "o",
+            "ú": "u", "ü": "u", "ç": "c",
+        }
+        return "".join(replacements.get(char, char) for char in text)
+
+    def _infer_rowwise_quantity_action(self, description: str) -> str | None:
+        if any(token in description for token in ("produzir", "producao", "fabricar", "production", "produce")):
+            return "produce_qty"
+        if any(token in description for token in ("enviar", "envio", "embarcar", "shipping", "ship")):
+            return "ship_qty"
+        if any(token in description for token in ("alocar", "alocacao", "allocate", "allocation")):
+            return "allocate_qty"
+        if any(token in description for token in ("comprar", "compra", "purchase", "procurement")):
+            return "purchase_qty"
+        return None
+
+    def _find_objective_parameter(
+        self,
+        rows: list[dict[str, Any]],
+        columns: list[str],
+        description_text: str,
+        current_sense: Any,
+    ) -> tuple[str | None, str | None]:
+        candidates: list[tuple[int, str, str]] = []
+        objective_words = []
+        sense = current_sense if current_sense in {"minimize", "maximize"} else None
+        if any(token in description_text for token in ("lucro", "profit", "margem", "revenue", "receita", "faturamento")):
+            objective_words.extend(("profit", "lucro", "revenue", "receita", "margin", "margem", "price", "preco"))
+            sense = "maximize"
+        if any(token in description_text for token in ("custo", "cost", "despesa", "expense")):
+            objective_words.extend(("cost", "custo", "expense", "despesa"))
+            sense = "minimize"
+        if not objective_words:
+            return None, sense
+
+        for column in columns:
+            normalized = self._normalize_text(column)
+            if column.lower() in {"product", "produto", "item", "category", "categoria", "id", "name", "nome"}:
+                continue
+            values = [self._to_number(row.get(column)) for row in rows if isinstance(row, dict)]
+            if not values or any(value is None for value in values):
+                continue
+            score = 0
+            for word in objective_words:
+                if self._normalize_text(word) in normalized:
+                    score += 10
+            if score:
+                candidates.append((score, column, sense or "maximize"))
+        if not candidates:
+            return None, sense
+        candidates.sort(reverse=True)
+        _, column, inferred_sense = candidates[0]
+        return column, inferred_sense
+
+    def _find_entity_column(self, rows: list[dict[str, Any]], columns: list[str]) -> str | None:
+        preferred = ("product", "produto", "item", "category", "categoria", "sku", "id", "name", "nome")
+        for candidate in preferred:
+            column = self._find_column(columns, (candidate,))
+            if column:
+                values = {str(row.get(column, "")).strip() for row in rows if isinstance(row, dict)}
+                if values and any(value for value in values):
+                    return column
+        for column in columns:
+            values = [row.get(column) for row in rows if isinstance(row, dict)]
+            if len(values) >= 2 and all(self._to_number(value) is None for value in values):
+                return column
+        return None
+
+    def _find_column(self, columns: list[str], aliases: tuple[str, ...]) -> str | None:
+        normalized_aliases = {self._normalize_text(alias) for alias in aliases}
+        for column in columns:
+            normalized = self._normalize_text(column)
+            if normalized in normalized_aliases:
+                return column
+        return None
+
+    @staticmethod
+    def _to_number(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            number = float(str(value).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            return None
+        return number
+
+    @staticmethod
+    def _format_number(value: float) -> str:
+        if float(value).is_integer():
+            return str(int(value))
+        return format(value, ".15g")
+
+    @staticmethod
+    def _safe_variable_name(value: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9_]", "_", value.strip())
+        normalized = re.sub(r"_+", "_", normalized).strip("_") or "x"
+        if normalized[0].isdigit():
+            normalized = f"v_{normalized}"
+        return normalized
+
+    @staticmethod
+    def _infer_problem_family(current: Any, action: str, description: str) -> str:
+        if current and current != "generic":
+            return current
+        if action == "produce_qty":
+            return "production_planning"
+        return "generic"
+
+    @staticmethod
+    def _unique_strings(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        result: list[str] = []
+        for value in values:
+            if value and value not in seen:
+                result.append(value)
+                seen.add(value)
+        return result
 
     # ========================================================
     # Repair prompt

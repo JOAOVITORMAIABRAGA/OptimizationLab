@@ -9,19 +9,20 @@ import io
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from algorithms.registry import AlgorithmRegistry
 from compatibility.compatibility_engine import CompatibilityEngine, CompatibilityStatus
 from domain.expressions import StructuredExpression
 from domain.objectives import ObjectiveKind, ObjectiveSense
-from domain.problem import DomainSpec, ObjectiveSpec, OptimizationProblem, SolutionRepresentationSpec, VariableSpec
+from domain.problem import ConstraintSpec, DomainSpec, ObjectiveSpec, OptimizationProblem, SolutionRepresentationSpec, VariableSpec
 from domain.problem_family import MathematicalProperty, ProblemFamily
 from domain.representations import SolutionRepresentationKind
 from domain.variables import VariableType
 from recommendation.recommendation_engine import RecommendationEngine
 from validation.validator import ValidationEngine
 from services.llm_service import GroqLLMService
+from services.execution_engine import OptimizationExecutionEngine
 
 
 class VariableInput(BaseModel):
@@ -31,15 +32,42 @@ class VariableInput(BaseModel):
     upper_bound: Optional[float] = None
 
 
+class ConstraintInput(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    kind: str = "hard"
+    relation: str
+    expression: Optional[str] = None
+    lower_bound: Optional[float] = None
+    upper_bound: Optional[float] = None
+    threshold: Optional[float] = None
+
+
+class ObjectiveInput(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    sense: ObjectiveSense
+    expression: str = Field(min_length=1)
+
+
 class ProblemInput(BaseModel):
     name: str = Field(min_length=1)
+
+    @field_validator("representation", mode="before")
+    @classmethod
+    def normalize_representation(cls, value):
+        if value in ("", None):
+            return SolutionRepresentationKind.VECTOR
+        return value
     description: Optional[str] = None
     problem_family: ProblemFamily = ProblemFamily.GENERIC
     mathematical_properties: List[MathematicalProperty] = Field(default_factory=list)
     variables: List[VariableInput] = Field(min_length=1)
     objective_kind: ObjectiveKind = ObjectiveKind.SINGLE
     objective_sense: ObjectiveSense = ObjectiveSense.MINIMIZE
-    expression: str = Field(min_length=1)
+    expression: str = ""
+    objectives: List[ObjectiveInput] = Field(default_factory=list)
+    constraints: List[ConstraintInput] = Field(default_factory=list)
     representation: SolutionRepresentationKind = SolutionRepresentationKind.VECTOR
 
 
@@ -159,7 +187,7 @@ def build_problem(payload: ProblemInput) -> OptimizationProblem:
     if len(variable_names) != len(payload.variables):
         raise ValueError("Variable names must be unique.")
 
-    expression = ExpressionParser().parse(payload.expression, variable_names)
+    expression = ExpressionParser().parse(payload.expression, variable_names) if payload.expression else None
     variables: List[VariableSpec] = []
     for item in payload.variables:
         if item.variable_type == VariableType.BINARY:
@@ -174,13 +202,44 @@ def build_problem(payload: ProblemInput) -> OptimizationProblem:
             domain = DomainSpec(kind="categorical")
         variables.append(VariableSpec(name=item.name, variable_type=item.variable_type, domain=domain, lower_bound=item.lower_bound, upper_bound=item.upper_bound))
 
+    if payload.objective_kind == ObjectiveKind.MULTI:
+        if len(payload.objectives) < 2:
+            raise ValueError("Multiobjective problems require at least two objectives.")
+        from domain.objectives import ObjectiveComponent
+        objectives = tuple(
+            ObjectiveComponent(item.id, item.name, item.sense, ExpressionParser().parse(item.expression, variable_names))
+            for item in payload.objectives
+        )
+        objective = ObjectiveSpec(kind=ObjectiveKind.MULTI, sense=None, expression=None, objectives=objectives)
+    else:
+        if expression is None:
+            raise ValueError("A single objective expression is required.")
+        objective = ObjectiveSpec(kind=payload.objective_kind, sense=payload.objective_sense, expression=expression)
+
+    constraints = []
+    for item in payload.constraints:
+        constraint_expression = ExpressionParser().parse(item.expression, variable_names) if item.expression else None
+        constraints.append(
+            ConstraintSpec(
+                id=item.id,
+                name=item.name,
+                kind=item.kind,
+                relation=item.relation,
+                expression=constraint_expression,
+                lower_bound=item.lower_bound,
+                upper_bound=item.upper_bound,
+                threshold=item.threshold,
+            )
+        )
+
     return OptimizationProblem(
         name=payload.name,
         description=payload.description,
         problem_family=payload.problem_family,
         mathematical_properties=set(payload.mathematical_properties),
         variables=variables,
-        objective=ObjectiveSpec(kind=payload.objective_kind, sense=payload.objective_sense, expression=expression),
+        constraints=constraints,
+        objective=objective,
         solution_representation=SolutionRepresentationSpec(kind=payload.representation, name=payload.representation.value),
     )
 
@@ -256,11 +315,15 @@ def summarize_csv(content: bytes, filename: str) -> Dict[str, Any]:
         raise ValueError("CSV must contain a header row.")
 
     rows: List[Dict[str, Any]] = []
+    sample_rows: List[Dict[str, Any]] = []
     row_count = 0
+    max_model_rows = 5000
     for row in reader:
         row_count += 1
-        if len(rows) < 8:
-            rows.append(row)
+        if len(sample_rows) < 8:
+            sample_rows.append(dict(row))
+        if len(rows) < max_model_rows:
+            rows.append(dict(row))
 
     columns = [name.strip() for name in reader.fieldnames if name and name.strip()]
     if not columns:
@@ -271,7 +334,9 @@ def summarize_csv(content: bytes, filename: str) -> Dict[str, Any]:
         "row_count": row_count,
         "column_count": len(columns),
         "columns": columns,
-        "sample_rows": rows,
+        "sample_rows": sample_rows,
+        "rows": rows,
+        "rows_truncated": row_count > max_model_rows,
     }
 
 
@@ -397,3 +462,38 @@ def analyze(payload: ProblemInput) -> AnalysisResponse:
     excluded = [{"algorithm_id": item.algorithm_id, "reason": item.reason, "compatibility_status": item.compatibility_status.value if item.compatibility_status else None, "evidence": list(item.evidence)} for item in recommendations_result.excluded_algorithms]
 
     return AnalysisResponse(problem=problem_to_dict(problem), validation=validation, compatibility=compatibility_results, recommendations=recommendations, excluded_algorithms=excluded)
+
+
+class SolveProblemRequest(ProblemInput):
+    algorithm_id: str = Field(min_length=1)
+
+
+class SolveProblemResponse(BaseModel):
+    algorithm_id: str
+    solution: List[float]
+    variable_values: Dict[str, float]
+    objective_value: float
+    parameters: Dict[str, Any]
+
+
+execution_engine = OptimizationExecutionEngine(registry)
+
+
+@app.post("/api/solve", response_model=SolveProblemResponse)
+def solve(payload: SolveProblemRequest) -> SolveProblemResponse:
+    try:
+        problem = build_problem(payload)
+        result = execution_engine.execute(problem, payload.algorithm_id)
+    except (ValueError, KeyError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    variable_values = {
+        variable.name: float(value)
+        for variable, value in zip(problem.variables, result.solution)
+    }
+    return SolveProblemResponse(
+        algorithm_id=result.algorithm_id,
+        solution=result.solution,
+        variable_values=variable_values,
+        objective_value=result.objective_value,
+        parameters=result.parameters,
+    )

@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 
 import csv
 import io
-import os
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -366,26 +365,7 @@ def problem_to_dict(problem: OptimizationProblem) -> Dict[str, Any]:
 
 
 app = FastAPI(title="Optimization Lab MVP API", version="0.1.0")
-
-
-def _csv_env(name: str) -> list[str]:
-    """Read a comma-separated environment setting into normalized values."""
-    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
-
-
-# CORS is infrastructure configuration: origins can change between local,
-# preview and production environments without changing application code.
-cors_origins = _csv_env("CORS_ORIGINS")
-cors_origin_regex = os.getenv("CORS_ORIGIN_REGEX") or None
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_origins,
-    allow_origin_regex=cors_origin_regex,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://optimization-lab-livid.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 validation_engine = ValidationEngine()
 compatibility_engine = CompatibilityEngine()

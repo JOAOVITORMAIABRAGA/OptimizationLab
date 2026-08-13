@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import ast
 import operator
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,8 @@ from adapters.problem_adapters import BUILTIN_ADAPTERS
 from validation.validator import ValidationEngine
 from services.llm_service import GroqLLMService
 from services.execution_engine import OptimizationExecutionEngine
+
+from dotenv import load_dotenv
 
 
 class VariableInput(BaseModel):
@@ -365,7 +368,27 @@ def problem_to_dict(problem: OptimizationProblem) -> Dict[str, Any]:
 
 
 app = FastAPI(title="Optimization Lab MVP API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://optimization-lab-livid.vercel.app"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+load_dotenv()
+
+print("CORS_ORIGINS =", repr(os.getenv("CORS_ORIGINS")))
+
+def _load_cors_origins() -> list[str]:
+    """Load comma-separated CORS origins from the environment."""
+    return [
+        origin.strip().rstrip("/")
+        for origin in os.getenv("CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_load_cors_origins(),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 validation_engine = ValidationEngine()
 compatibility_engine = CompatibilityEngine()

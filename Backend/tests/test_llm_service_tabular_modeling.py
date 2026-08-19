@@ -290,6 +290,46 @@ def test_graph_completion_infers_explicit_shortest_path_endpoints():
     assert completed["representation_metadata"]["target"] == "C"
 
 
+
+def test_llm_modeling_uses_zero_temperature():
+    service = GroqLLMService.__new__(GroqLLMService)
+    service.model = "llama-3.3-70b-versatile"
+
+    class Message:
+        content = '{"name":"x"}'
+
+    class Choice:
+        message = Message()
+
+    class Response:
+        choices = [Choice()]
+
+    class Completions:
+        def __init__(self):
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return Response()
+
+    class Client:
+        def __init__(self):
+            self.chat = type("Chat", (), {"completions": Completions()})()
+
+    service.client = Client()
+    service._request_model("Return JSON.")
+    assert service.client.chat.completions.calls[0]["temperature"] == 0.0
+
+
+def test_modeling_prompt_requires_plain_language_explanation():
+    service = GroqLLMService.__new__(GroqLLMService)
+    prompt = service._build_prompt("Choose quantities to maximize profit.", DATASET)
+    assert 'USER-FACING EXPLANATION' in prompt
+    assert 'WHAT THE MODEL DECIDES' in prompt
+    assert 'HOW THE MODEL MEASURES SUCCESS' in prompt
+    assert 'WHAT LIMITS THE DECISION' in prompt
+    assert 'three short paragraphs' in prompt
+
 def test_json_transport_falls_back_after_groq_json_validation_error():
     service = GroqLLMService.__new__(GroqLLMService)
     service.model = "llama-3.3-70b-versatile"

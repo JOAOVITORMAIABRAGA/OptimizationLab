@@ -31,6 +31,9 @@ load_dotenv(ENV_FILE, override=True)
 # ============================================================
 
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
+# Keep mathematical model generation deterministic: the LLM is proposing
+# a model, not creatively generating one.
+LLM_TEMPERATURE = 0.0
 
 ALLOWED_EXPRESSION_FUNCTIONS = {
     "abs",
@@ -275,7 +278,7 @@ class GroqLLMService:
                         },
                     ],
                     "model": self.model,
-                    "temperature": 0,
+                    "temperature": LLM_TEMPERATURE,
                 }
                 if response_format is not None:
                     kwargs["response_format"] = response_format
@@ -717,6 +720,48 @@ OBJECTIVE
 The objective must faithfully represent the user's requested goal.
 
 Do NOT replace a cost objective with a quantity objective.
+
+============================================================
+USER-FACING EXPLANATION
+============================================================
+
+The "explanation" field is shown directly to a non-expert user before
+validation. Write it as a short, clear teaching explanation, not as an
+internal reasoning trace and not as a chatbot response.
+
+Use exactly three short paragraphs separated by a blank line:
+
+1. WHAT THE MODEL DECIDES
+   Explain in simple language what the user is choosing, minimizing,
+   maximizing, assigning, routing, producing, etc.
+
+2. HOW THE MODEL MEASURES SUCCESS
+   Explain in simple language what the objective means and how the main
+   data values contribute to it. For example, if expected revenue uses a
+   conversion rate but acquisition cost applies to every purchased unit,
+   say that explicitly. Do not assume the user understands mathematical
+   notation.
+
+3. WHAT LIMITS THE DECISION
+   Briefly explain the main restrictions such as demand, budget, capacity,
+   weight, deadlines, or bounds. Mention only restrictions actually used
+   by the model.
+
+Prefer everyday terms such as "units purchased", "expected sales",
+"available budget" and "storage capacity" over unexplained technical
+jargon. You may mention the mathematical idea in plain language, but do
+not turn the explanation into a formula dump.
+
+The "assumptions" field is also shown to the user. Each item must explain
+ONE decision or uncertainty that the model had to make because the user's
+description or data did not define it completely. Write each item as a
+short, concrete sentence that starts with the consequence for the model.
+Do not use vague phrases such as "the AI assumes". If there is no real
+uncertainty, keep the list focused on meaningful modeling choices.
+
+Do not claim that a constraint is unnecessary merely because the data
+looks reasonable. Only say that all records satisfy a requirement when the
+provided data actually supports that conclusion.
 
 For example:
 
@@ -1261,19 +1306,19 @@ Use exactly these top-level fields:
 
         assumptions = list(result.get("assumptions") or [])
         assumptions.append(
-            f"The '{entity_column}' column defines the decision entities; "
-            f"'{coefficient_column}' is used as the per-entity objective coefficient."
+            f"Each value in '{entity_column}' is treated as a separate decision, "
+            f"and '{coefficient_column}' supplies its contribution to the objective."
         )
         if lower_column:
-            assumptions.append(f"'{lower_column}' supplies the lower production bound for each entity.")
+            assumptions.append(f"The '{lower_column}' column sets the minimum allowed quantity for each decision.")
         if upper_column:
-            assumptions.append(f"'{upper_column}' supplies the upper production bound for each entity.")
+            assumptions.append(f"The '{upper_column}' column sets the maximum allowed quantity for each decision.")
         completed["assumptions"] = self._unique_strings(assumptions)
 
         explanation = str(result.get("explanation") or "").strip()
         completion_note = (
-            f"The tabular dataset defines one decision quantity per {entity_column}; "
-            f"the objective is expanded using {coefficient_column}."
+            f"The data provides one decision quantity for each {entity_column}, "
+            f"and the objective uses {coefficient_column} to measure the contribution of each choice."
         )
         completed["explanation"] = f"{explanation} {completion_note}".strip()
         return completed

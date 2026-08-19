@@ -322,3 +322,63 @@ def test_json_transport_falls_back_after_groq_json_validation_error():
     assert result == {"name": "x"}
     assert len(service.client.chat.completions.calls) == 2
     assert "response_format" not in service.client.chat.completions.calls[1]
+
+
+def test_multi_source_purchase_bounds_are_materialized_from_demand_table():
+    service = GroqLLMService.__new__(GroqLLMService)
+    raw = {
+        "name": "production planning",
+        "description": "",
+        "problem_family": "production_planning",
+        "mathematical_properties": ["integer", "linear", "constrained"],
+        "variables": [
+            {"name": f"purchase_qty_{pid}", "variable_type": "integer", "lower_bound": None, "upper_bound": None}
+            for pid in ("P001", "P002", "P003")
+        ],
+        "objective_kind": "single",
+        "objective_sense": "maximize",
+        "expression": "325*purchase_qty_P001 + 290*purchase_qty_P002 + 50*purchase_qty_P003",
+        "representation": "vector",
+        "explanation": "Purchase planning.",
+        "assumptions": [],
+    }
+    dataset = {
+        "source_count": 2,
+        "multi_source": True,
+        "sources": [
+            {
+                "filename": "produtos.csv",
+                "source_kind": "tabular",
+                "columns": ["product_id", "cost"],
+                "rows": [
+                    {"product_id": "P001", "cost": 1800},
+                    {"product_id": "P002", "cost": 700},
+                    {"product_id": "P003", "cost": 250},
+                ],
+                "rows_truncated": False,
+            },
+            {
+                "filename": "demanda.csv",
+                "source_kind": "tabular",
+                "columns": ["product_id", "monthly_demand", "expected_conversion_rate"],
+                "rows": [
+                    {"product_id": "P001", "monthly_demand": 35, "expected_conversion_rate": 0.85},
+                    {"product_id": "P002", "monthly_demand": 50, "expected_conversion_rate": 0.90},
+                    {"product_id": "P003", "monthly_demand": 80, "expected_conversion_rate": 0.75},
+                ],
+                "rows_truncated": False,
+            },
+        ],
+    }
+
+    completed = service._complete_multi_source_quantity_bounds(
+        raw,
+        "Não quero comprar mais unidades de um produto do que a demanda mensal estimada.",
+        dataset,
+    )
+
+    assert [(item["name"], item["lower_bound"], item["upper_bound"]) for item in completed["variables"]] == [
+        ("purchase_qty_P001", 0.0, 35.0),
+        ("purchase_qty_P002", 0.0, 50.0),
+        ("purchase_qty_P003", 0.0, 80.0),
+    ]

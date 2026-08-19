@@ -25,10 +25,11 @@ from recommendation.recommendation_engine import RecommendationEngine
 from adapters.problem_adapters import BUILTIN_ADAPTERS
 from validation.validator import ValidationEngine
 from services.llm_service import GroqLLMService
+from services.dataset_service import DatasetError, DatasetService
 from services.execution_engine import OptimizationExecutionEngine
 
 from dotenv import load_dotenv
-
+from pathlib import Path
 
 class VariableInput(BaseModel):
     name: str = Field(min_length=1)
@@ -107,6 +108,7 @@ class AIModelResponse(BaseModel):
     explanation: str
     assumptions: List[str]
     dataset: Dict[str, Any]
+    datasets: List[Dict[str, Any]] = Field(default_factory=list)
     incomplete: bool = False
 
 
@@ -369,9 +371,9 @@ def problem_to_dict(problem: OptimizationProblem) -> Dict[str, Any]:
 
 app = FastAPI(title="Optimization Lab MVP API", version="0.1.0")
 
-load_dotenv()
+BASE_DIR = Path(__file__).resolve().parent
 
-print("CORS_ORIGINS =", repr(os.getenv("CORS_ORIGINS")))
+load_dotenv(BASE_DIR / ".env")
 
 def _load_cors_origins() -> list[str]:
     """Load comma-separated CORS origins from the environment."""
@@ -415,47 +417,7 @@ def metadata() -> Dict[str, Any]:
     }
 
 
-def summarize_csv(content: bytes, filename: str) -> Dict[str, Any]:
-    if not filename.lower().endswith(".csv"):
-        raise ValueError("Only CSV datasets are supported in the MVP.")
-
-    if len(content) > 10 * 1024 * 1024:
-        raise ValueError("CSV file is too large. Maximum size is 10 MB.")
-
-    try:
-        text = content.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise ValueError("CSV must be encoded as UTF-8.") from exc
-
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise ValueError("CSV must contain a header row.")
-
-    rows: List[Dict[str, Any]] = []
-    sample_rows: List[Dict[str, Any]] = []
-    row_count = 0
-    max_model_rows = 5000
-    for row in reader:
-        row_count += 1
-        if len(sample_rows) < 8:
-            sample_rows.append(dict(row))
-        if len(rows) < max_model_rows:
-            rows.append(dict(row))
-
-    columns = [name.strip() for name in reader.fieldnames if name and name.strip()]
-    if not columns:
-        raise ValueError("CSV must contain at least one named column.")
-
-    return {
-        "filename": filename,
-        "row_count": row_count,
-        "column_count": len(columns),
-        "columns": columns,
-        "sample_rows": sample_rows,
-        "rows": rows,
-        "rows_truncated": row_count > max_model_rows,
-    }
-
+dataset_service = DatasetService()
 
 def validate_ai_draft(draft: Dict[str, Any]) -> AIDraftProblem:
     # AI proposals have a separate, intentionally permissive contract.
@@ -515,15 +477,40 @@ def _model_problem_view(problem_payload: AIDraftProblem) -> Dict[str, Any]:
     return data
 
 
+def _dataset_response_view(dataset: Dict[str, Any]) -> Dict[str, Any]:
+    """Return dataset metadata to the client without echoing full modeling rows."""
+    sources = []
+    for source in dataset.get("sources", []):
+        sources.append({
+            key: source.get(key)
+            for key in ("filename", "source_name", "sheet", "format", "row_count", "column_count", "columns", "sample_rows", "source_kind")
+            if key in source
+        })
+    response = {
+        "source_count": dataset.get("source_count", len(sources)),
+        "multi_source": dataset.get("multi_source", len(sources) > 1),
+        "total_size_bytes": dataset.get("total_size_bytes", 0),
+        "sources": sources,
+    }
+    if len(sources) == 1:
+        source = sources[0]
+        response.update({key: source.get(key) for key in ("filename", "format", "row_count", "column_count", "columns", "sample_rows")})
+    return response
+
+
 @app.post("/api/model", response_model=AIModelResponse)
-async def model_problem(description: str = Form(...), file: UploadFile = File(...)) -> AIModelResponse:
+async def model_problem(description: str = Form(...), files: List[UploadFile] = File(...)) -> AIModelResponse:
     print(">>> /api/model FOI CHAMADO <<<")
     if not description.strip():
         raise HTTPException(status_code=422, detail="Problem description is required.")
 
     try:
-        content = await file.read()
-        dataset = summarize_csv(content, file.filename or "dataset.csv")
+        if not files:
+            raise DatasetError("At least one dataset is required.")
+        uploaded = []
+        for file in files:
+            uploaded.append((file.filename or "dataset", await file.read()))
+        dataset = dataset_service.summarize_files(uploaded)
         dataset["allowed_values"] = {
             "problem_families": [item.value for item in ProblemFamily],
             "mathematical_properties": [item.value for item in MathematicalProperty],
@@ -562,7 +549,8 @@ async def model_problem(description: str = Form(...), file: UploadFile = File(..
         problem=_model_problem_view(problem_payload),
         explanation=str(draft.get("explanation", "The AI proposed this model based on your description and dataset.")),
         assumptions=[str(item) for item in draft.get("assumptions", [])],
-        dataset={key: value for key, value in dataset.items() if key != "allowed_values"},
+        dataset=_dataset_response_view(dataset),
+        datasets=[_dataset_response_view({"sources": [source]})["sources"][0] for source in dataset.get("sources", [])],
         incomplete=incomplete,
     )
 

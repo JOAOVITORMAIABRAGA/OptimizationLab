@@ -43,9 +43,10 @@ dataset; the system never fabricates missing parameters.
 The backend currently handles:
 
 -   REST API endpoints;
--   multipart CSV uploads;
--   dataset inspection;
--   dataset summaries;
+-   multipart dataset uploads (up to 10 files);
+-   CSV, TXT and XLSX parsing;
+-   multi-source dataset inspection;
+-   dataset summaries with per-source provenance;
 -   environment configuration;
 -   Groq integration;
 -   structured LLM responses;
@@ -216,15 +217,17 @@ POST /api/model
 Content-Type: multipart/form-data
 
 problem_description = "..."
-file = dataset.csv
+files = dataset.csv
+files = demand.csv
+files = constraints.xlsx
 ```
 
 The backend then:
 
 1.  receives the request;
-2.  validates the file;
-3.  parses the dataset;
-4.  creates a dataset summary;
+2.  validates the uploaded files;
+3.  parses each source independently;
+4.  creates a per-source dataset summary;
 5.  sends relevant context to the LLM;
 6.  receives structured JSON;
 7.  validates the generated model;
@@ -393,8 +396,9 @@ Errors should fail safely rather than bypass validation.
 ### Current
 
 -   [x] FastAPI application
--   [x] CSV upload
--   [x] Dataset summary
+-   [x] Multiple dataset upload
+-   [x] CSV, TXT and XLSX support
+-   [x] Per-source dataset summaries
 -   [x] Groq integration
 -   [x] LLM problem modeling
 -   [x] Structured response

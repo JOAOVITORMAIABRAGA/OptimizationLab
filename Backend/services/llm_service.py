@@ -166,6 +166,11 @@ class GroqLLMService:
             problem_description=problem_description,
             dataset=dataset,
         )
+        result = self._complete_multi_source_quantity_bounds(
+            result=result,
+            problem_description=problem_description,
+            dataset=dataset,
+        )
         result = self._complete_tabular_constraints(
             result=result,
             problem_description=problem_description,
@@ -197,6 +202,11 @@ class GroqLLMService:
                 repair_prompt
             )
             repaired_result = self._complete_tabular_model(
+                result=repaired_result,
+                problem_description=problem_description,
+                dataset=dataset,
+            )
+            repaired_result = self._complete_multi_source_quantity_bounds(
                 result=repaired_result,
                 problem_description=problem_description,
                 dataset=dataset,
@@ -448,6 +458,15 @@ The USER defines what the optimizer should decide.
 The DATASET describes observed information and possible parameters.
 
 These two concepts are different.
+
+The dataset input may contain multiple independent sources. Each source is
+identified by filename (and, for XLSX files, worksheet). Treat each source
+as a distinct table or text source. Do NOT assume that sources are joined.
+Only relate sources when the user description or the data clearly provides a
+shared key/semantic relationship. Never fabricate a join, aggregation, or
+matching rule. When several sources jointly determine the model, use the
+information from all relevant sources and state the relationship in the
+assumptions.
 
 A decision variable does NOT need to exist as a column in the dataset.
 
@@ -1094,6 +1113,17 @@ Use exactly these top-level fields:
     # Deterministic tabular completion
     # ========================================================
 
+    @staticmethod
+    def _single_tabular_source(dataset: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the legacy flat source only when exactly one tabular source exists."""
+        sources = dataset.get("sources")
+        if isinstance(sources, list):
+            if len(sources) != 1:
+                return None
+            source = sources[0]
+            return source if isinstance(source, dict) and source.get("source_kind") == "tabular" else None
+        return dataset if dataset.get("columns") else None
+
     def _complete_tabular_model(
         self,
         result: dict[str, Any],
@@ -1110,15 +1140,16 @@ Use exactly these top-level fields:
         from rows/parameters to the scalar declarative model consumed by
         OptimizationProblem. It never invents numerical values.
         """
-        if dataset.get("rows_truncated"):
+        single = self._single_tabular_source(dataset)
+        if single is None or single.get("rows_truncated"):
             return result
-        rows = dataset.get("rows") or dataset.get("sample_rows") or []
+        rows = single.get("rows") or single.get("sample_rows") or []
         if not isinstance(rows, list) or len(rows) < 1:
             return result
         if not isinstance(result, dict) or not result.get("variables"):
             return result
 
-        columns = [str(item).strip() for item in dataset.get("columns", []) if str(item).strip()]
+        columns = [str(item).strip() for item in single.get("columns", []) if str(item).strip()]
         normalized_columns = {self._normalize_text(column): column for column in columns}
         description_text = self._normalize_text(problem_description)
 
@@ -1247,6 +1278,155 @@ Use exactly these top-level fields:
         completed["explanation"] = f"{explanation} {completion_note}".strip()
         return completed
 
+    def _complete_multi_source_quantity_bounds(
+        self,
+        result: dict[str, Any],
+        problem_description: str,
+        dataset: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Complete scalar quantity bounds from a related tabular source.
+
+        Multi-source modeling intentionally keeps file parsing separate from
+        semantic modeling. Once the LLM has identified the decision
+        variables, however, a hard quantity limit explicitly stated by the
+        user can be materialized deterministically from a related source.
+
+        This closes the gap between an indexed decision (for example,
+        ``purchase_qty_P001``) and a separate demand table containing
+        ``product_id`` + ``monthly_demand``. No numeric value is invented:
+        the bound must come directly from an uploaded source.
+        """
+        if not isinstance(result, dict) or not result.get("variables"):
+            return result
+
+        sources = dataset.get("sources") if isinstance(dataset, dict) else None
+        if not isinstance(sources, list) or len(sources) < 2:
+            return result
+        if not self._description_explicitly_caps_quantity(problem_description):
+            return result
+
+        variables = result.get("variables") or []
+        if not isinstance(variables, list):
+            return result
+
+        # Find a tabular source carrying a demand/capacity column and a key.
+        demand_source = None
+        entity_column = None
+        upper_column = None
+        for source in sources:
+            if not isinstance(source, dict) or source.get("source_kind") != "tabular":
+                continue
+            if source.get("rows_truncated"):
+                continue
+            rows = source.get("rows") or source.get("sample_rows") or []
+            columns = [str(c).strip() for c in source.get("columns", []) if str(c).strip()]
+            if not rows or not columns:
+                continue
+            candidate_entity = self._find_entity_column(rows, columns)
+            candidate_upper = self._find_column(
+                columns,
+                ("monthly_demand", "demand", "estimated_demand", "expected_demand", "max_quantity", "maximum_quantity", "max_qty", "capacity"),
+            )
+            if candidate_entity and candidate_upper:
+                demand_source = source
+                entity_column = candidate_entity
+                upper_column = candidate_upper
+                break
+
+        if demand_source is None or entity_column is None or upper_column is None:
+            return result
+
+        rows = demand_source.get("rows") or demand_source.get("sample_rows") or []
+        lookup: dict[str, float] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            key = row.get(entity_column)
+            value = self._to_number(row.get(upper_column))
+            if key is None or value is None:
+                continue
+            lookup[str(key).strip()] = value
+
+        if not lookup:
+            return result
+
+        changed = False
+        completed_variables: list[dict[str, Any]] = []
+        missing_keys: list[str] = []
+        for variable in variables:
+            if not isinstance(variable, dict):
+                return result
+            updated = dict(variable)
+            name = str(updated.get("name") or "")
+            # The LLM convention is <decision>_<entity>. Prefer the longest
+            # exact entity suffix to avoid accidental partial matches.
+            entity = next(
+                (key for key in sorted(lookup, key=len, reverse=True) if name == key or name.endswith(f"_{key}")),
+                None,
+            )
+            if entity is None:
+                completed_variables.append(updated)
+                continue
+
+            if updated.get("upper_bound") is None:
+                updated["upper_bound"] = lookup[entity]
+                changed = True
+            elif float(updated["upper_bound"]) != float(lookup[entity]):
+                # Do not silently overwrite an explicit AI bound. A mismatch
+                # is a modeling uncertainty and is left visible for review.
+                completed_variables.append(updated)
+                continue
+            if updated.get("lower_bound") is None and updated.get("variable_type") in {"integer", "continuous"}:
+                updated["lower_bound"] = 0.0
+                changed = True
+            completed_variables.append(updated)
+
+        if not changed:
+            return result
+
+        completed = dict(result)
+        completed["variables"] = completed_variables
+        assumptions = list(result.get("assumptions") or [])
+        assumptions.append(
+            f"'{upper_column}' from the uploaded source '{demand_source.get('filename', 'dataset')}' "
+            f"is used as the per-{entity_column} upper bound for purchase quantities."
+        )
+        completed["assumptions"] = self._unique_strings(assumptions)
+        return completed
+
+    @staticmethod
+    def _description_explicitly_caps_quantity(description: str) -> bool:
+        normalized = GroqLLMService._normalize_text(description)
+        purchase_action = any(token in normalized for token in (
+            "comprar", "compra", "purchase", "buy",
+        ))
+        demand_reference = any(token in normalized for token in (
+            "demanda", "demand",
+        ))
+        cap_language = any(token in normalized for token in (
+            "nao quero comprar mais",
+            "nao posso comprar mais",
+            "nao comprar mais",
+            "nao ultrapassar",
+            "nao exceder",
+            "nao superar",
+            "nao seja maior",
+            "nao pode ser maior",
+            "limite",
+            "maximo",
+            "maior do que",
+            "maior que",
+            "not buy more",
+            "do not buy more",
+            "cannot buy more",
+            "not exceed",
+            "do not exceed",
+            "cannot exceed",
+            "not greater than",
+            "maximum",
+        ))
+        return purchase_action and demand_reference and cap_language
+
     def _complete_tabular_constraints(
         self,
         result: dict[str, Any],
@@ -1260,10 +1440,11 @@ Use exactly these top-level fields:
         """
         if not isinstance(result, dict) or not result.get("variables"):
             return result
-        if dataset.get("rows_truncated"):
+        single = self._single_tabular_source(dataset)
+        if single is None or single.get("rows_truncated"):
             return result
-        rows = dataset.get("rows") or dataset.get("sample_rows") or []
-        columns = [str(item).strip() for item in dataset.get("columns", []) if str(item).strip()]
+        rows = single.get("rows") or single.get("sample_rows") or []
+        columns = [str(item).strip() for item in single.get("columns", []) if str(item).strip()]
         if not rows or not columns:
             return result
 

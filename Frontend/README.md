@@ -101,7 +101,7 @@ and late-delivery risk.
 
 ### 2. Upload a dataset
 
-The user provides a CSV relevant to the problem.
+The user can provide one or more CSV, TXT or XLSX sources relevant to the problem (up to 10 files).
 
 ### 3. Generate model
 
@@ -133,7 +133,7 @@ optimization solver.
 | React / TypeScript      |
 |                         |
 | Problem description     |
-| CSV upload              |
+| Multi-file dataset upload |
 | Model result            |
 +------------+------------+
              |
@@ -273,7 +273,7 @@ The modeling request sends:
 ``` text
 problem description
 +
-CSV file
+one or more CSV/TXT/XLSX files
 ```
 
 to:
@@ -482,7 +482,8 @@ overwhelming first-time users.
 -   [x] React + TypeScript
 -   [x] Vite
 -   [x] Problem description input
--   [x] CSV upload
+-   [x] Multiple dataset upload
+-   [x] CSV, TXT and XLSX support
 -   [x] Backend integration
 -   [x] AI-generated problem model display
 -   [x] Environment-based API URL

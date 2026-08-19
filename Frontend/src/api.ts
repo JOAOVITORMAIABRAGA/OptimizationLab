@@ -20,11 +20,13 @@ export type ProblemForm = {
   problem_structure?: string | null
   problem_structure_metadata?: Record<string, unknown>
   representation_metadata?: Record<string, unknown>
+  constraints?: Array<Record<string, unknown>>
 }
 
 export type AIProblem = Omit<ProblemForm, 'representation'> & {
   representation: string | null
   objective?: { kind?: string; sense?: string; status?: string; metric?: string | null; expression?: unknown }
+  constraints?: Array<Record<string, unknown>>
 }
 
 export type Analysis = {
@@ -36,11 +38,24 @@ export type Analysis = {
   excluded_algorithms: { algorithm_id: string; reason: string; compatibility_status: string | null; evidence: string[] }[]
 }
 
+export type DatasetSource = {
+  filename: string
+  source_name?: string
+  sheet?: string
+  format: string
+  row_count: number
+  column_count: number
+  columns: string[]
+  sample_rows: Record<string, unknown>[]
+  source_kind?: string
+}
+
 export type AIModel = {
   problem: AIProblem
   explanation: string
   assumptions: string[]
-  dataset: { filename: string; row_count: number; column_count: number; columns: string[]; sample_rows: Record<string, string>[] }
+  dataset: { source_count?: number; multi_source?: boolean; filename?: string; row_count?: number; column_count?: number; columns?: string[]; sample_rows?: Record<string, unknown>[]; sources?: DatasetSource[] }
+  datasets: DatasetSource[]
   incomplete: boolean
 }
 
@@ -51,10 +66,10 @@ async function parseError(response: Response, fallback: string) {
   return data.detail ?? fallback
 }
 
-export async function modelProblem(description: string, file: File): Promise<AIModel> {
+export async function modelProblem(description: string, files: File[]): Promise<AIModel> {
   const body = new FormData()
   body.append('description', description)
-  body.append('file', file)
+  for (const file of files) body.append('files', file)
   const response = await fetch(`${API_URL}/api/model`, { method: 'POST', body })
   if (!response.ok) throw new Error(await parseError(response, 'Could not model the problem with AI.'))
   return response.json()

@@ -23,7 +23,7 @@ function renderValue(value: unknown): string {
 function App() {
   const [mode, setMode] = useState<Mode>('ai')
   const [description, setDescription] = useState('')
-  const [file, setFile] = useState<File | null>(null)
+  const [files, setFiles] = useState<File[]>([])
   const [aiModel, setAiModel] = useState<AIModel | null>(null)
   const [form, setForm] = useState<ProblemForm>(emptyForm)
   const [meta, setMeta] = useState(fallback)
@@ -41,9 +41,9 @@ function App() {
 
   const runAI = async () => {
     if (!description.trim()) return setError('Describe the optimization problem first.')
-    if (!file) return setError('Upload a CSV dataset first.')
+    if (files.length === 0) return setError('Upload at least one dataset first.')
     setLoading(true); setError(''); setAiModel(null); setResult(null); setSolution(null)
-    try { setAiModel(await modelProblem(description, file)) } catch(e) { setError(e instanceof Error?e.message:'AI modeling failed.') } finally { setLoading(false) }
+    try { setAiModel(await modelProblem(description, files)) } catch(e) { setError(e instanceof Error?e.message:'AI modeling failed.') } finally { setLoading(false) }
   }
 
   const validateProblem = async (problem: ProblemForm) => {
@@ -87,7 +87,17 @@ function App() {
   }
 
   const toggle = (p:string) => setForm(f=>({...f,mathematical_properties:f.mathematical_properties.includes(p)?f.mathematical_properties.filter(x=>x!==p):[...f.mathematical_properties,p]}))
-  const selectFile = (f: File | undefined) => { if (!f) return; if (!f.name.toLowerCase().endsWith('.csv')) return setError('Only CSV files are supported in this MVP.'); setFile(f); setError('') }
+  const addFiles = (incoming: File[]) => {
+    const allowed = ['.csv', '.txt', '.xlsx']
+    const invalid = incoming.find(f => !allowed.some(ext => f.name.toLowerCase().endsWith(ext)))
+    if (invalid) return setError(`Unsupported dataset format: ${invalid.name}. Use CSV, TXT or XLSX.`)
+    setFiles(current => {
+      const merged = [...current, ...incoming]
+      const unique = merged.filter((file, index, all) => all.findIndex(other => other.name === file.name && other.size === file.size && other.lastModified === file.lastModified) === index)
+      return unique.slice(0, 10)
+    })
+    setError('')
+  }
 
   return <div className="shell">
     <header><div><div className="eyebrow">AI MODEL · VALIDATE · RECOMMEND</div><h1>Optimization <span>Lab</span></h1><p>Turn a real-world problem into a validated optimization model.</p></div><div className="status"><i/> Backend-driven</div></header>
@@ -95,10 +105,11 @@ function App() {
       <section className="hero card">
         <div className="hero-copy"><span className="step">01</span><div><h2>What do you want to optimize?</h2><p>The default flow uses the AI modeler to translate your description and dataset into an OptimizationProblem.</p></div></div>
         <label>Problem description<textarea rows={5} placeholder="Example: I need to optimize delivery routes for 120 customers. Each vehicle has a capacity limit and I want to minimize total distance..." value={description} onChange={e=>setDescription(e.target.value)}/></label>
-        <div className="upload" onClick={()=>fileRef.current?.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();selectFile(e.dataTransfer.files[0])}}>
-          <input ref={fileRef} type="file" accept=".csv,text/csv" hidden onChange={e=>selectFile(e.target.files?.[0])}/>
-          {file ? <><FileText size={26}/><div><strong>{file.name}</strong><span>Dataset ready for analysis</span></div><button className="ghost" type="button" onClick={e=>{e.stopPropagation();setFile(null)}}><X size={16}/></button></> : <><Upload size={26}/><div><strong>Drop your CSV here</strong><span>or click to browse · max 10 MB</span></div></>}
+        <div className="upload" onClick={()=>fileRef.current?.click()} onDragOver={e=>e.preventDefault()} onDrop={e=>{e.preventDefault();addFiles(Array.from(e.dataTransfer.files))}}>
+          <input ref={fileRef} type="file" multiple accept=".csv,.txt,.xlsx,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" hidden onChange={e=>addFiles(Array.from(e.target.files ?? []))}/>
+          {files.length > 0 ? <><FileText size={26}/><div><strong>{files.length} dataset{files.length===1?'':'s'} selected</strong><span>CSV, TXT or XLSX · up to 10 files</span></div><button className="ghost" type="button" onClick={e=>{e.stopPropagation();setFiles([])}}><X size={16}/></button></> : <><Upload size={26}/><div><strong>Drop your datasets here</strong><span>CSV, TXT or XLSX · up to 10 files · 10 MB each</span></div></>}
         </div>
+        {files.length > 0 && <div className="dataset-list">{files.map((item,index)=><div className="dataset-card" key={`${item.name}-${item.size}-${item.lastModified}`}><FileText size={16}/><strong>{item.name}</strong><span>{(item.size/1024/1024).toFixed(2)} MB</span><button className="icon" type="button" onClick={()=>setFiles(current=>current.filter((_,i)=>i!==index))}>×</button></div>)}</div>}
         {error && <div className="alert error"><X size={18}/>{error}</div>}
         <button className="primary" onClick={runAI} disabled={loading}>{loading?'Modeling problem…':'Analyze with AI'}<Sparkles size={18}/></button>
         <button className="advanced-link" onClick={()=>{setMode('advanced');setError('')}}><Settings2 size={15}/> Configure manually instead</button>
@@ -110,7 +121,8 @@ function App() {
         <div className="grid two"><div className="info"><span>Problem family</span><strong>{aiModel.problem.problem_family}</strong></div><div className="info"><span>Objective</span><strong>{aiModel.problem.objective_sense}{aiModel.problem.expression ? ` · ${aiModel.problem.expression}` : aiModel.problem.objective_metric ? ` · ${aiModel.problem.objective_metric}` : ' · Not yet determined'}</strong></div></div>
         <div className="grid two"><div className="info"><span>Decision variables</span><strong>{aiModel.problem.variables.length > 0 ? aiModel.problem.variables.map(v=>v.name).join(', ') : 'Not determined'}</strong></div><div className="info"><span>Model status</span><strong>{aiModel.incomplete ? 'Incomplete — needs review' : 'Complete proposal'}</strong></div></div>
         <div className="info"><span>Mathematical properties</span><div className="chips readonly">{aiModel.problem.mathematical_properties.map(p=><span className="chip active" key={p}>{p}</span>)}</div></div>
-        <div className="dataset-card"><div><FileText size={17}/><strong>{aiModel.dataset.filename}</strong><span>{aiModel.dataset.row_count.toLocaleString()} rows · {aiModel.dataset.column_count} columns</span></div><small>{aiModel.dataset.columns.join(' · ')}</small></div>
+        <div className="dataset-card"><div><FileText size={17}/><strong>{aiModel.datasets.length} data source{aiModel.datasets.length===1?'':'s'} analyzed</strong><span>{aiModel.datasets.map(source => source.source_name || source.filename).join(' · ')}</span></div></div>
+        <div className="dataset-list">{aiModel.datasets.map(source=><div className="dataset-card" key={source.source_name || source.filename}><div><FileText size={15}/><strong>{source.source_name || source.filename}</strong><span>{source.row_count.toLocaleString()} rows · {source.column_count} columns · {source.format.toUpperCase()}</span></div><small>{source.columns.join(' · ')}</small></div>)}</div>
         {aiModel.assumptions.length>0 && <div className="assumptions"><AlertTriangle size={16}/><div><strong>AI assumptions / uncertainties</strong>{aiModel.assumptions.map(a=><div key={a}>• {a}</div>)}</div></div>}
         <div className="actions"><button className="ghost" onClick={()=>{setForm({...aiModel.problem, representation: aiModel.problem.representation || 'vector'});setAiModel(null);setMode('advanced')}}><Settings2 size={16}/> Edit model</button><button className="primary compact" disabled={aiModel.incomplete || loading} onClick={acceptAI}>{aiModel.incomplete ? 'Edit model to continue' : loading ? 'Validating…' : 'Accept & validate'} {!aiModel.incomplete && !loading && <ArrowRight size={17}/>}</button></div>
       </section>}

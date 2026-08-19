@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
+from math import gcd, lcm
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -286,6 +288,68 @@ except ImportError:  # Optional runtime backend; SciPy remains a real exact fall
 
 
 class OrToolsConstraintProgrammingAdapter:
+    """Translate the canonical linear model to CP-SAT's integer contract.
+
+    CP-SAT requires integer coefficients and integer bounds. The domain model
+    is intentionally allowed to use real-valued linear coefficients, so this
+    adapter scales each affine row independently by the smallest exact common
+    denominator. Positive scaling preserves the feasible set and the optimum.
+    """
+
+    @staticmethod
+    def _rational(value: float) -> Fraction:
+        return Fraction(str(float(value)))
+
+    @staticmethod
+    def _reduce_integer_scale(values: Sequence[int]) -> tuple[list[int], int]:
+        nonzero = [abs(int(value)) for value in values if int(value) != 0]
+        if not nonzero:
+            return [int(value) for value in values], 1
+        common = nonzero[0]
+        for value in nonzero[1:]:
+            common = gcd(common, value)
+        return [int(value) // common for value in values], common
+
+    @classmethod
+    def _integerize_row(cls, coefficients: Sequence[float], lower: float, upper: float) -> tuple[np.ndarray, float, float, int]:
+        rationals = [cls._rational(value) for value in coefficients]
+        denominators = [item.denominator for item in rationals if item.numerator != 0]
+        for bound in (lower, upper):
+            if np.isfinite(bound):
+                denominators.append(cls._rational(bound).denominator)
+        scale = 1
+        for denominator in denominators:
+            scale = lcm(scale, denominator)
+        raw_integers = [int(item * scale) for item in rationals]
+        scaled_lower_int = int(cls._rational(lower) * scale) if np.isfinite(lower) else None
+        scaled_upper_int = int(cls._rational(upper) * scale) if np.isfinite(upper) else None
+        reduction_values = list(raw_integers)
+        if scaled_lower_int is not None:
+            reduction_values.append(scaled_lower_int)
+        if scaled_upper_int is not None:
+            reduction_values.append(scaled_upper_int)
+        reduced, common = cls._reduce_integer_scale(reduction_values)
+        integer_coefficients = reduced[: len(raw_integers)]
+        cursor = len(raw_integers)
+        scaled_lower = float(reduced[cursor]) if scaled_lower_int is not None else -np.inf
+        if scaled_lower_int is not None:
+            cursor += 1
+        scaled_upper = float(reduced[cursor]) if scaled_upper_int is not None else np.inf
+        integers = np.asarray(integer_coefficients, dtype=np.int64)
+        return integers, scaled_lower, scaled_upper, max(1, scale // common)
+
+    @classmethod
+    def _integerize_objective(cls, coefficients: Sequence[float], constant: float) -> tuple[np.ndarray, int, int]:
+        rationals = [cls._rational(value) for value in coefficients] + [cls._rational(constant)]
+        scale = 1
+        for value in rationals:
+            scale = lcm(scale, value.denominator)
+        raw_integers = [int(value * scale) for value in rationals]
+        reduced, common = cls._reduce_integer_scale(raw_integers)
+        integers = np.asarray(reduced[:-1], dtype=np.int64)
+        integer_constant = int(reduced[-1])
+        return integers, integer_constant, max(1, scale // common)
+
     def solve(self, model: SolverModel) -> Tuple[List[float], float]:
         if cp_model is None:
             raise RuntimeError("OR-Tools CP-SAT is not installed.")
@@ -299,34 +363,37 @@ class OrToolsConstraintProgrammingAdapter:
             variables.append(solver_model.NewIntVar(int(low), int(high), name))
 
         for row, low, high in zip(model.constraint_matrix, model.constraint_lower, model.constraint_upper):
-            expression = sum(int(coefficient) * variable for coefficient, variable in zip(row, variables))
-            if any(abs(coefficient - round(coefficient)) > 1e-12 for coefficient in row):
-                raise SolverTranslationError("CP-SAT backend requires integral linear coefficients.")
-            if np.isfinite(low) and np.isfinite(high) and low == high:
-                solver_model.Add(expression == int(round(low)))
+            integer_row, scaled_low, scaled_high, _ = self._integerize_row(row, low, high)
+            expression = sum(int(coefficient) * variable for coefficient, variable in zip(integer_row, variables))
+            if np.isfinite(scaled_low) and np.isfinite(scaled_high) and scaled_low == scaled_high:
+                solver_model.Add(expression == int(scaled_low))
             else:
-                if np.isfinite(low):
-                    solver_model.Add(expression >= int(round(low)))
-                if np.isfinite(high):
-                    solver_model.Add(expression <= int(round(high)))
+                if np.isfinite(scaled_low):
+                    solver_model.Add(expression >= int(scaled_low))
+                if np.isfinite(scaled_high):
+                    solver_model.Add(expression <= int(scaled_high))
 
-        objective_terms = [int(coefficient) * variable for coefficient, variable in zip(model.objective, variables)]
-        if any(abs(coefficient - round(coefficient)) > 1e-12 for coefficient in model.objective):
-            raise SolverTranslationError("CP-SAT backend requires integral objective coefficients.")
-        objective = sum(objective_terms) + int(round(model.objective_constant))
-        if model.objective_sense == ObjectiveSense.MAXIMIZE:
-            solver_model.Maximize(objective)
-        else:
-            solver_model.Minimize(objective)
+        objective_coefficients, objective_constant, _ = self._integerize_objective(
+            model.objective, model.objective_constant
+        )
+        objective = sum(int(coefficient) * variable for coefficient, variable in zip(objective_coefficients, variables)) + objective_constant
+        # ``ClassicalModelAdapter`` canonicalizes every maximization objective
+        # to a minimization objective by negating its coefficients. CP-SAT must
+        # therefore minimize this transformed expression as well. Calling
+        # ``Maximize`` here would optimize the negated objective and can return
+        # the worst solution of the original maximization problem (often the
+        # all-zero solution when variables are non-negative).
+        solver_model.Minimize(objective)
 
         solver = cp_model.CpSolver()
         status = solver.Solve(solver_model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             raise RuntimeError(f"CP-SAT solver failed with status {solver.StatusName(status)}")
         solution = [float(solver.Value(variable)) for variable in variables]
-        objective_value = float(sum(coefficient * value for coefficient, value in zip(model.objective, solution)) + model.objective_constant)
-        if model.objective_sense == ObjectiveSense.MAXIMIZE:
-            objective_value = -objective_value
+        transformed_objective = float(np.dot(model.objective, solution) + model.objective_constant)
+        objective_value = -transformed_objective if model.objective_sense == ObjectiveSense.MAXIMIZE else transformed_objective
+        if objective_value == -0.0:
+            objective_value = 0.0
         return solution, objective_value
 
 
